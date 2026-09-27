@@ -1,0 +1,40 @@
+# Controller namespace: the ingest API accepts connections only from agent pods; metrics
+# only from inside the namespace (adjust for your Prometheus); PostgreSQL only from the
+# controller.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: acp-runner-controller-ingress
+  namespace: acp-runner-system
+spec:
+  podSelector:
+    matchLabels: {app.kubernetes.io/name: acp-runner-controller}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: {acp-runner.dev/agents: "true"}
+          podSelector:
+            matchLabels: {app.kubernetes.io/name: acp-runner-agent}
+      ports:
+        - {protocol: TCP, port: 8081}
+    - from:
+        - podSelector: {}
+      ports:
+        - {protocol: TCP, port: 8080}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: acp-runner-postgres-ingress
+  namespace: acp-runner-system
+spec:
+  podSelector:
+    matchLabels: {app.kubernetes.io/name: acp-runner-postgres}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: {app.kubernetes.io/name: acp-runner-controller}
+      ports:
+        - {protocol: TCP, port: 5432}
