@@ -356,7 +356,9 @@ enum TurnEnd {
 }
 
 async fn build_context(spec: &AgentLaunchSpec) -> Result<DriverContext, FailureReason> {
-    let credential_env = take_staged_credentials(spec)?;
+    // With bootstrap commands, runnerd places the credentials only after `BootstrapDone`;
+    // they are taken after `Proceed` (see `run`).
+    let credential_env = if spec.bootstrap.is_empty() { take_staged_credentials(spec)? } else { vec![] };
     let _ = std::fs::create_dir_all(&spec.tmp);
     let base_path = spec.path_env.clone().or_else(|| std::env::var("PATH").ok());
     let path_env = if spec.path_prepend.is_empty() {
@@ -398,18 +400,28 @@ async fn run_bootstrap(
 ) -> Result<(), Option<AgentExit>> {
     let mut base = ctx.clone();
     base.credential_env.clear();
+    // Orphans of a setup command (daemons, double forks, setsid) are re-parented to agentd
+    // instead of PID 1, so they can be found and killed: nothing the bootstrap starts may
+    // outlive it and still be running when the credentials are placed.
+    let _reaper = Subreaper::enable();
     for (i, step) in spec.bootstrap.iter().enumerate() {
         let name = step.command.rsplit('/').next().unwrap_or(&step.command).to_string();
         let label = format!("exec[{i}] {name}");
         let fail = |detail: String| Err(Some(failed(FailureReason::BootstrapFailed { step: label.clone(), detail })));
-        let cwd = match &step.cwd {
+        // The directory is opened component by component without following symlinks (an
+        // earlier step may have planted one) and the step runs in exactly that directory.
+        let cwd_dir = match &step.cwd {
             Some(c) => match acp_runner_core::environment::normalize_workdir(c) {
-                Ok(rel) if rel.is_empty() => spec.workspace.clone(),
-                Ok(rel) => spec.workspace.join(rel),
+                Ok(rel) => open_dir_beneath(&spec.workspace, &rel),
                 Err(e) => return fail(e.to_string()),
             },
-            None => ctx.workspace.clone(),
+            None => open_dir_beneath(&ctx.workspace, ""),
         };
+        let cwd_dir = match cwd_dir {
+            Ok(d) => d,
+            Err(e) => return fail(format!("working directory: {e}")),
+        };
+        let cwd = fd_path(&cwd_dir);
         let env: Vec<(String, String)> = step.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         let env = match acp_runner_drivers::env::compose(&base, &env) {
             Ok(e) => e,
@@ -482,6 +494,8 @@ async fn run_bootstrap(
                    "seconds": started.elapsed().as_secs_f64(), "stdoutTail": stdout, "stderrTail": stderr}),
         )
         .await;
+        drop(cwd_dir);
+        let leftovers = kill_descendants(Duration::from_secs(2));
         if !exit.success() {
             return fail(format!(
                 "exit code {:?} signal {:?}: {}",
@@ -490,8 +504,111 @@ async fn run_bootstrap(
                 truncate_utf8(&stderr, 500).0
             ));
         }
+        if leftovers > 0 {
+            return fail(format!(
+                "left {leftovers} background process(es) running after it exited (killed); bootstrap \
+                 commands must not start daemons"
+            ));
+        }
     }
     Ok(())
+}
+
+/// `PR_SET_CHILD_SUBREAPER` for the duration of the bootstrap.
+struct Subreaper;
+
+impl Subreaper {
+    fn enable() -> Subreaper {
+        if let Err(e) = nix::sys::prctl::set_child_subreaper(true) {
+            tracing::warn!(error = %e, "PR_SET_CHILD_SUBREAPER failed");
+        }
+        Subreaper
+    }
+}
+
+impl Drop for Subreaper {
+    fn drop(&mut self) {
+        let _ = nix::sys::prctl::set_child_subreaper(false);
+    }
+}
+
+/// `(pid, ppid, state)` of every process visible in /proc.
+fn process_table() -> Vec<(i32, i32, char)> {
+    let mut out = vec![];
+    let Ok(rd) = std::fs::read_dir("/proc") else { return out };
+    for e in rd.flatten() {
+        let Some(pid) = e.file_name().to_str().and_then(|n| n.parse::<i32>().ok()) else { continue };
+        let Ok(stat) = std::fs::read_to_string(e.path().join("stat")) else { continue };
+        let Some((_, rest)) = stat.rsplit_once(')') else { continue };
+        let f: Vec<&str> = rest.split_whitespace().collect();
+        let (Some(state), Some(ppid)) = (f.first().and_then(|s| s.chars().next()), f.get(1)) else { continue };
+        if let Ok(ppid) = ppid.parse() {
+            out.push((pid, ppid, state));
+        }
+    }
+    out
+}
+
+/// Kill every descendant of this process (there are none legitimately between bootstrap
+/// steps) and reap the ones re-parented to us. Returns how many live processes were found.
+fn kill_descendants(budget: Duration) -> usize {
+    use nix::sys::signal::{Signal, kill};
+    use nix::sys::wait::{WaitPidFlag, waitpid};
+    use nix::unistd::Pid;
+    let me = std::process::id() as i32;
+    let deadline = Instant::now() + budget;
+    let mut found = std::collections::BTreeSet::new();
+    loop {
+        let table = process_table();
+        let mut desc = std::collections::BTreeSet::new();
+        let mut frontier = vec![me];
+        while let Some(p) = frontier.pop() {
+            for (pid, ppid, _) in &table {
+                if *ppid == p && *pid != me && desc.insert(*pid) {
+                    frontier.push(*pid);
+                }
+            }
+        }
+        let live: Vec<i32> =
+            table.iter().filter(|(pid, _, st)| desc.contains(pid) && *st != 'Z').map(|(pid, _, _)| *pid).collect();
+        for pid in &live {
+            found.insert(*pid);
+            let _ = kill(Pid::from_raw(*pid), Signal::SIGKILL);
+        }
+        // reap our own (re-parented) children; tokio has no child of ours alive here
+        for (pid, ppid, _) in &table {
+            if *ppid == me {
+                let _ = waitpid(Pid::from_raw(*pid), Some(WaitPidFlag::WNOHANG));
+            }
+        }
+        if live.is_empty() || Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    found.len()
+}
+
+/// Open `rel` below `root` one component at a time with `O_NOFOLLOW`.
+fn open_dir_beneath(root: &Path, rel: &str) -> std::io::Result<std::os::fd::OwnedFd> {
+    use nix::fcntl::{OFlag, open, openat};
+    use nix::sys::stat::Mode;
+    let flags = OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_RDONLY | OFlag::O_CLOEXEC;
+    let mut dir = open(root, flags, Mode::empty()).map_err(std::io::Error::from)?;
+    for c in rel.split('/').filter(|c| !c.is_empty() && *c != ".") {
+        if c == ".." {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "`..` in working directory"));
+        }
+        dir = openat(&dir, c, flags, Mode::empty()).map_err(std::io::Error::from)?;
+    }
+    Ok(dir)
+}
+
+/// A path that names exactly the opened directory in the child (fds survive fork; the
+/// child changes into it before `execve`).
+fn fd_path(fd: &std::os::fd::OwnedFd) -> PathBuf {
+    use std::os::fd::AsRawFd;
+    PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd()))
 }
 
 async fn run(
@@ -500,7 +617,7 @@ async fn run(
     inbox: &mut mpsc::Receiver<ToAgent>,
     data_socket: &Path,
 ) -> Option<AgentExit> {
-    let ctx = match build_context(spec).await {
+    let mut ctx = match build_context(spec).await {
         Ok(c) => c,
         Err(r) => return Some(failed(r)),
     };
@@ -524,7 +641,13 @@ async fn run(
         out.send(FromAgent::BootstrapDone { steps: spec.bootstrap.len() as u32 }).await;
         loop {
             match inbox.recv().await {
-                Some(ToAgent::Proceed) => break,
+                Some(ToAgent::Proceed) => {
+                    match take_staged_credentials(spec) {
+                        Ok(c) => ctx.credential_env = c,
+                        Err(r) => return Some(failed(r)),
+                    }
+                    break;
+                }
                 Some(ToAgent::Cancel { .. }) | Some(ToAgent::Finish) => return Some(cancelled_before_start()),
                 Some(ToAgent::Launch { .. }) => tracing::warn!("duplicate Launch ignored"),
                 None => return None,

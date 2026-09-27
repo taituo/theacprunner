@@ -68,9 +68,10 @@ CRD `AgentEnvironment` (`crates/acp-runner-k8s/src/crds.rs`, examples
 | 2 | checkout BASE at the exact revision (or the deterministic empty base) | runnerd | trusted |
 | 3 | overlays: artifact metadata → **hash verify** → resolve the original repo/base → apply | provider + runnerd | trusted |
 | 4 | configs/agents/skills + `bootstrap.files`: resolve → store (content-addressed) → fetch by digest → **verify** → place (`O_NOFOLLOW`) | provider + runnerd | trusted |
-| 5 | credential lease (provider) + ephemeral copies/staged env (runnerd) | provider + runnerd | trusted |
+| 5 | credential lease (provider); HOME directories only — no credential material yet | provider + runnerd | trusted |
 | 6 | validate workdir: real directory below `/workspace`, no `..`, no symlink on the way | runnerd | trusted |
-| 7 | `bootstrap.exec`: `execve(command, argv, env)`, cwd = workdir (or `cwd`), no shell, **no credentials** | **agentd** | **untrusted** |
+| 7 | `bootstrap.exec`: `execve(command, argv, env)`, cwd = workdir (or `cwd`, opened `O_NOFOLLOW` per component), no shell, **no credentials**; agentd is a child subreaper during setup and kills anything a step leaves running (→ `BootstrapFailed`) | **agentd** | **untrusted** |
+| 7b | after `BootstrapDone`: ephemeral credential copies/staged env placed (`O_EXCL`, no links), then `Proceed` | runnerd | trusted |
 | 8 | launch the harness as an ACP stdio agent, cwd = workdir → `Ready` | agentd | untrusted |
 | 9 | gateway listens → authenticated raw ACP | runnerd | trusted relay |
 

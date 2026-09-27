@@ -335,6 +335,11 @@ fn run_turn(sh: Arc<Shared>, id: Value, sid: String, scen: String) {
         "hang-hard" => {
             wait_cancelled(&sh, false);
         }
+        "has-env" => {
+            // reports whether a variable is set, never its value
+            let state = if std::env::var_os(&arg).is_some_and(|v| !v.is_empty()) { "present" } else { "absent" };
+            say(&sh, &sid, &format!("ENV {arg}={state}"));
+        }
         "trust-probe" => {
             let report = trust_probe();
             say(&sh, &sid, &format!("TRUST-PROBE {report}\n"));

@@ -247,12 +247,44 @@ pub fn prepare_home(
     secret_dir: Option<&Path>,
     redactor: &mut Redactor,
 ) -> Result<PreparedHome, FailureReason> {
+    prepare_home_base(home)?;
+    place_credentials(home, layout, secret_dir, redactor)
+}
+
+/// The credential-free part of the HOME (directories only).
+pub fn prepare_home_base(home: &Path) -> Result<(), FailureReason> {
     let io = |e: std::io::Error| FailureReason::Internal { detail: format!("preparing HOME: {e}") };
     std::fs::create_dir_all(home).map_err(io)?;
     std::fs::set_permissions(home, std::fs::Permissions::from_mode(0o700)).map_err(io)?;
     for d in [".config", ".cache", ".local/share", ".local/state"] {
         std::fs::create_dir_all(home.join(d)).map_err(io)?;
     }
+    Ok(())
+}
+
+/// Where [`place_credentials`] stages the environment-delivered credentials of `layout`
+/// (known before they are placed, so the launch spec can name them up front).
+pub fn staged_env_plan(layout: Option<&CredentialLayout>) -> Vec<StagedEnv> {
+    layout
+        .map(|l| {
+            l.env
+                .iter()
+                .map(|e| StagedEnv { env_name: e.env_name.clone(), rel: format!("{STAGED_CREDENTIALS_DIR}/{}", e.key) })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Place the leased credential copies into an already prepared HOME. Environment mode calls
+/// this only after the untrusted bootstrap has finished and its processes are gone, so setup
+/// commands never see credential material. Every write is `O_EXCL` below the HOME without
+/// following links: anything the bootstrap planted at a credential path fails the placement.
+pub fn place_credentials(
+    home: &Path,
+    layout: Option<&CredentialLayout>,
+    secret_dir: Option<&Path>,
+    redactor: &mut Redactor,
+) -> Result<PreparedHome, FailureReason> {
     let mut out = PreparedHome::default();
     let Some(layout) = layout else { return Ok(out) };
     let secret_dir = secret_dir.ok_or_else(|| FailureReason::CredentialUnavailable {

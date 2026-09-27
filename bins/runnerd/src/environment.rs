@@ -11,7 +11,7 @@
 
 use crate::agent_link::{AgentListener, AgentdLaunch, DataListener, reap_spawned};
 use crate::gateway::{Caller, Gateway, GatewayConfig, GatewayEvent};
-use crate::home::{PreparedHome, changed_writeback_files, prepare_home};
+use crate::home::{PreparedHome, changed_writeback_files, place_credentials, prepare_home_base, staged_env_plan};
 use crate::sink::{ArtifactUpload, EventSink};
 use crate::supervisor::{RunnerDirs, SupervisorOptions};
 use crate::tap::{AcpTap, Observed};
@@ -257,17 +257,40 @@ pub async fn run_environment(
         }
         Err(reason) => fail_early!(reason),
     }
-    // 5. lease + materialize credentials (the lease is held by the provider for the
-    //    environment's lifetime; runnerd places ephemeral copies)
-    let prepared_home =
-        match prepare_home(&dirs.home, spec.credentials.as_ref(), dirs.secret_dir.as_deref(), &mut em.redactor) {
+    // 5. HOME (the lease is held by the provider for the environment's lifetime; runnerd
+    //    places ephemeral copies). With untrusted bootstrap commands the credentials are
+    //    placed only after they finished and agentd killed whatever they left behind.
+    if let Err(reason) = prepare_home_base(&dirs.home) {
+        fail_early!(reason)
+    }
+    let defer_credentials = !plan.exec.is_empty();
+    let mut prepared_home = PreparedHome::default();
+    if !defer_credentials {
+        prepared_home = match place_credentials(
+            &dirs.home,
+            spec.credentials.as_ref(),
+            dirs.secret_dir.as_deref(),
+            &mut em.redactor,
+        ) {
             Ok(h) => h,
             Err(reason) => fail_early!(reason),
         };
-    let home = Some(&prepared_home);
+        credentials_placed(&mut em, spec.credentials.as_ref()).await;
+    }
     macro_rules! fail {
         ($reason:expr) => {
-            return finish_now(&mut em, EnvironmentPhase::Failed, Some($reason), &ws, &dirs, home, &collect, 0, 0).await
+            return finish_now(
+                &mut em,
+                EnvironmentPhase::Failed,
+                Some($reason),
+                &ws,
+                &dirs,
+                Some(&prepared_home),
+                &collect,
+                0,
+                0,
+            )
+            .await
         };
     }
     // 6. validate the workdir (real directory below the workspace, no symlinks)
@@ -330,8 +353,7 @@ pub async fn run_environment(
         home: dirs.agent.home.clone(),
         tmp: dirs.agent.tmp.clone(),
         env: spec.env.clone(),
-        credential_env: prepared_home
-            .staged_env
+        credential_env: staged_env_plan(spec.credentials.as_ref())
             .iter()
             .map(|s| StagedCredentialEnv { env_name: s.env_name.clone(), path: dirs.agent.home.join(&s.rel) })
             .collect(),
@@ -382,6 +404,22 @@ pub async fn run_environment(
                     }
                 } else {
                     em.progress("bootstrap_exec_done", "bootstrap commands finished", json!({"steps": steps})).await;
+                }
+                if defer_credentials {
+                    match place_credentials(
+                        &dirs.home,
+                        spec.credentials.as_ref(),
+                        dirs.secret_dir.as_deref(),
+                        &mut em.redactor,
+                    ) {
+                        Ok(h) => prepared_home = h,
+                        Err(reason) => {
+                            conn.close();
+                            reap_spawned(child.take(), grace).await;
+                            fail!(reason);
+                        }
+                    }
+                    credentials_placed(&mut em, spec.credentials.as_ref()).await;
                 }
                 if conn.send(&ToAgent::Proceed).await.is_err() {
                     conn.close();
@@ -906,4 +944,17 @@ async fn finish_now(
     let _ = em.sink.flush().await;
     let _ = dirs;
     res
+}
+
+async fn credentials_placed(em: &mut Em<'_>, layout: Option<&acp_runner_core::attempt_spec::CredentialLayout>) {
+    if let Some(l) = layout {
+        em.progress(
+            "credentials_placed",
+            "credential copies placed in the synthetic HOME",
+            json!({"provider": l.provider, "profile": l.profile,
+                   "files": l.files.iter().map(|f| &f.target).collect::<Vec<_>>(),
+                   "stagedEnv": l.env.iter().map(|e| &e.env_name).collect::<Vec<_>>()}),
+        )
+        .await;
+    }
 }

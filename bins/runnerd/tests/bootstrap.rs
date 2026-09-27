@@ -337,3 +337,90 @@ async fn pinned_harness_artifact_is_verified_and_materialized() {
     let (res, _) = Running::launch(&env, move |s| s.bootstrap.harness = Some(href), sink).result().await;
     assert!(matches!(&res.reason, Some(FailureReason::BootstrapFailed { step, .. }) if step == "harness"), "{res:?}");
 }
+
+/// V4: untrusted setup commands never see credential material (it is placed after they
+/// finished), cannot leave processes behind, and cannot redirect a later step's cwd with a
+/// symlink.
+#[tokio::test]
+async fn bootstrap_runs_before_credentials_and_leaves_nothing_behind() {
+    let mut env = TestEnv::new(&Target::fake_acp()).await;
+    env.add_env_credential("claude", "oauth-token", "CLAUDE_CODE_OAUTH_TOKEN", FAKE_CLAUDE_TOKEN.as_bytes());
+    env.add_file_credential(
+        "claude",
+        "settings",
+        ".config/fake/credential.json",
+        br#"{"k":"placed-late-value"}"#,
+        false,
+    );
+    let r = Running::start_with_sink(
+        &env,
+        |s| {
+            s.bootstrap.exec = vec![exec(
+                "/bin/sh",
+                &[
+                    "-c",
+                    "{ ls -A \"$HOME\"/.config/fake 2>&1; ls -A \"$HOME\"/.acp-credentials 2>&1; } > seen-by-setup.txt; true",
+                ],
+                Some(""),
+            )];
+        },
+        MemorySink::default(),
+    )
+    .await;
+    // the harness got both credentials after the setup ran
+    let (mut client, session) = connect_session(&r.gateway, &r.ticket(), Transport::Raw).await.unwrap();
+    let t = client.prompt(&session, "[[fake:has-env:CLAUDE_CODE_OAUTH_TOKEN]]").await.unwrap();
+    assert!(t.text.contains("ENV CLAUDE_CODE_OAUTH_TOKEN=present"), "{t:?}");
+    let dirs = r.dirs.clone();
+    assert!(dirs.home.join(".config/fake/credential.json").exists());
+    assert!(!dirs.home.join(".acp-credentials").exists(), "staged env credentials are consumed by agentd");
+    let (res, sink) = r.finish().await;
+    assert_eq!(res.phase, EnvironmentPhase::Completed, "{res:?}");
+    let seen = std::fs::read_to_string(dirs.workspace.join("seen-by-setup.txt")).unwrap();
+    assert!(!seen.contains("credential.json") && !seen.contains("oauth-token"), "setup saw credentials: {seen}");
+    let rec = sink.snapshot();
+    let pos = |cat: &str| {
+        rec.events.iter().position(|e| e.data.get("category").and_then(|c| c.as_str()) == Some(cat)).unwrap()
+    };
+    assert!(pos("bootstrap_exec_done") < pos("credentials_placed"));
+
+    // a daemon started by a setup command is killed and fails the bootstrap
+    let (res, _) = Running::launch(
+        &env,
+        |s| s.bootstrap.exec = vec![exec("/bin/sh", &["-c", "setsid sleep 300 >/dev/null 2>&1 < /dev/null &"], None)],
+        MemorySink::default(),
+    )
+    .result()
+    .await;
+    assert!(
+        matches!(&res.reason, Some(FailureReason::BootstrapFailed { detail, .. }) if detail.contains("background process")),
+        "{res:?}"
+    );
+    assert!(!sleepers_alive(), "the daemon survived");
+
+    // a symlink planted by one step does not become the next step's cwd
+    let (res, _) = Running::launch(
+        &env,
+        |s| {
+            s.bootstrap.exec =
+                vec![exec("ln", &["-s", "/", "escape"], Some("")), exec("touch", &["planted-outside"], Some("escape"))]
+        },
+        MemorySink::default(),
+    )
+    .result()
+    .await;
+    assert!(
+        matches!(&res.reason, Some(FailureReason::BootstrapFailed { step, detail }) if step.contains("exec[1]") && detail.contains("working directory")),
+        "{res:?}"
+    );
+}
+
+fn sleepers_alive() -> bool {
+    std::fs::read_dir("/proc").unwrap().flatten().any(|e| {
+        std::fs::read_to_string(e.path().join("cmdline")).is_ok_and(|c| c == "sleep\u{0}300\u{0}")
+            && std::fs::read_to_string(e.path().join("stat"))
+                .ok()
+                .and_then(|s| s.rsplit_once(')').map(|(_, r)| !r.trim_start().starts_with('Z')))
+                .unwrap_or(false)
+    })
+}
