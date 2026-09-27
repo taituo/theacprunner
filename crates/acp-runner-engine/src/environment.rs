@@ -713,21 +713,32 @@ impl EnvironmentProvider {
             self.finalize(&env).await;
             return Ok(());
         }
-        let events = self.journal.events_for_attempt(env.attempt_id, &[], 100_000).await?;
+        // Only runnerd-sourced events are consulted (agents cannot emit these categories, and
+        // the lookups are targeted instead of scanning the attempt's whole journal).
+        let progress = self
+            .journal
+            .latest_runner_progress(
+                env.attempt_id,
+                &["gateway_listening", "workspace_ready", "environment_ready", "environment_busy", "turn_ended"],
+            )
+            .await?;
         // connection ref: from the gateway_listening event.
         if env.connection_ref.is_none()
-            && let Some(addr) = events.iter().find_map(|e| gateway_addr(&e.data))
+            && let Some(addr) = progress.iter().find_map(|e| gateway_addr(&e.data))
         {
-            let base = events.iter().find_map(|e| base_revision(&e.data));
+            let base = progress.iter().find_map(|e| base_revision(&e.data));
             self.journal.set_environment_connection(env_id, &json!({"gateway": addr}), base.as_deref()).await?;
         }
         // terminal?
-        const TERMINAL: &[&str] = &["AttemptCompleted", "AttemptFailed", "AttemptTimedOut"];
-        if let Some(term) = events.iter().rev().find(|e| TERMINAL.contains(&e.kind.as_str())) {
+        if let Some(term) = self.journal.latest_terminal_event(env.attempt_id).await? {
             let phase = if term.kind == "AttemptCompleted" { "Completed" } else { "Failed" };
             let reason = term.data.get("reason").and_then(|r| serde_json::from_value::<FailureReason>(r.clone()).ok());
             if let Some(id) = term.data.get("finalArtifactId").and_then(|v| v.as_str()).and_then(|s| s.parse().ok()) {
-                self.journal.set_environment_final_artifact(env_id, id, None).await?;
+                if self.artifact_of_attempt(id, env.attempt_id).await {
+                    self.journal.set_environment_final_artifact(env_id, id, None).await?;
+                } else {
+                    tracing::warn!(environment_id = %env_id, artifact_id = %id, "final artifact belongs to another attempt; ignored");
+                }
             }
             self.journal.set_environment_phase(env_id, phase, reason.as_ref()).await?;
             let _ = self
@@ -749,7 +760,8 @@ impl EnvironmentProvider {
         }
         // live phase from the last relevant progress event.
         let mut phase = "Creating";
-        for e in &events {
+        for e in &progress {
+            // `progress` is ordered by event id: the last matching category wins.
             match e.data.get("category").and_then(|c| c.as_str()) {
                 Some("environment_ready") | Some("turn_ended") => phase = "Idle",
                 Some("environment_busy") => phase = "Busy",
@@ -848,18 +860,22 @@ impl EnvironmentProvider {
         let sid = self.snapshot(env_id, label).await?;
         let deadline = Instant::now() + timeout;
         loop {
-            for e in self.journal.events_for_attempt(env.attempt_id, &[EventKind::Progress], 100_000).await? {
+            for e in self.journal.runner_progress_with_detail(env.attempt_id, "snapshotId", &sid.to_string()).await? {
                 let cat = e.data.get("category").and_then(|c| c.as_str());
-                let id = e.data.pointer("/detail/snapshotId").and_then(|v| v.as_str());
-                if id == Some(sid.to_string().as_str()) {
+                {
                     match cat {
                         Some("snapshot_created") => {
-                            return e
+                            let id: Uuid = e
                                 .data
                                 .pointer("/detail/artifactId")
                                 .and_then(|v| v.as_str())
                                 .and_then(|s| s.parse().ok())
-                                .ok_or_else(|| anyhow::anyhow!("snapshot event without artifact id"));
+                                .ok_or_else(|| anyhow::anyhow!("snapshot event without artifact id"))?;
+                            anyhow::ensure!(
+                                self.artifact_of_attempt(id, env.attempt_id).await,
+                                "snapshot {sid} names an artifact of another attempt"
+                            );
+                            return Ok(id);
                         }
                         Some(c @ ("snapshot_rejected" | "snapshot_failed")) => anyhow::bail!("snapshot {sid}: {c}"),
                         _ => {}
@@ -917,6 +933,13 @@ impl EnvironmentProvider {
             }
             tokio::time::sleep(Duration::from_millis(150)).await;
         }
+    }
+}
+
+impl EnvironmentProvider {
+    /// Was artifact `id` uploaded by `attempt_id`?
+    async fn artifact_of_attempt(&self, id: Uuid, attempt_id: Uuid) -> bool {
+        self.artifacts.get_meta(id).await.map(|m| m.attempt_id == attempt_id).unwrap_or(false)
     }
 }
 

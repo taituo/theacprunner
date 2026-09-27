@@ -23,6 +23,9 @@ jobs:
           --health-cmd "pg_isready -U acp" --health-interval 2s --health-retries 30
     env:
       ACP_TEST_DATABASE_URL: postgres://acp:acp@127.0.0.1:55432/postgres
+      # PostgreSQL and envtest suites must run in CI: a missing dependency fails the job
+      # instead of printing SKIPPED.
+      ACP_REQUIRE_DB_TESTS: "1"
       ENVTEST_VERSION: v1.37.0
     steps:
       - uses: actions/checkout@v4
@@ -41,6 +44,14 @@ jobs:
           echo "ACP_E2E_AGENT_SANDBOX_CRDS=$PWD/.cache/agent-sandbox.yaml" >> "$GITHUB_ENV"
       - name: fmt, clippy, unit + integration + envtest e2e
         run: scripts/test.sh
+      - name: CRDs are up to date
+        run: |
+          cargo run -q -p acp-runner-controller -- crdgen > /tmp/crds.yaml
+          diff -u deploy/crds/acp-runner.dev_crds.yaml /tmp/crds.yaml
+      - name: dependency advisories and licenses
+        run: |
+          cargo install --locked cargo-deny@0.18.4
+          cargo deny check advisories licenses
       - name: driver compatibility (fake + real codex adapter without credentials)
         run: scripts/compat.sh --targets fake-acp,fake-claude,codex-noauth
 

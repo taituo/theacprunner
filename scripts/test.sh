@@ -8,7 +8,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 cargo fmt --all -- --check || echo "warning: rustfmt differences"
 cargo clippy --workspace --all-targets -q -- -D warnings
-cargo build -q -p fake-acp-agent -p runnerd -p agentd -p acp-runner-controller
+cargo build -q -p fake-acp-agent -p runnerd -p agentd -p acp-runner-controller -p acp-egress-proxy -p acp-openai-shim
 cargo test --workspace -q
 if [ -z "${ACP_TEST_DATABASE_URL:-}" ]; then
   echo "NOTE: ACP_TEST_DATABASE_URL unset — journal/engine/kube e2e tests were skipped (scripts/dev-postgres.sh)"

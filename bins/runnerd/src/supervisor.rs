@@ -252,7 +252,7 @@ impl<'a> Emitter<'a> {
                 self.emit_env(EventKind::PermissionRequest, EventSource::Agent, data, raw).await
             }
             AgentEvent::Progress { data, raw } => {
-                self.emit_env(EventKind::Progress, EventSource::Agent, data, raw).await
+                self.emit_env(EventKind::Progress, EventSource::Agent, data.into_agent_owned(), raw).await
             }
         }
     }

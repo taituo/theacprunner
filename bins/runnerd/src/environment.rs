@@ -93,9 +93,11 @@ impl Em<'_> {
             AgentEvent::PermissionRequest { data, raw } => {
                 (EventKind::PermissionRequest, serde_json::to_value(data).unwrap_or(Value::Null), raw.clone())
             }
-            AgentEvent::Progress { data, raw } => {
-                (EventKind::Progress, serde_json::to_value(data).unwrap_or(Value::Null), raw.clone())
-            }
+            AgentEvent::Progress { data, raw } => (
+                EventKind::Progress,
+                serde_json::to_value(data.clone().into_agent_owned()).unwrap_or(Value::Null),
+                raw.clone(),
+            ),
         };
         let mut data = data;
         self.redactor.redact_json(&mut data);

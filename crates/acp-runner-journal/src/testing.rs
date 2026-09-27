@@ -25,9 +25,19 @@ impl TempDb {
     }
 }
 
+/// Skip a test whose external dependency is missing, or fail it when the environment says
+/// every such test must run (`ACP_REQUIRE_DB_TESTS=1` in CI), so a misconfigured CI job cannot
+/// silently turn the PostgreSQL / Kubernetes suites into no-ops.
+pub fn skip_or_fail(what: &str) {
+    if std::env::var("ACP_REQUIRE_DB_TESTS").is_ok_and(|v| v == "1" || v == "true") {
+        panic!("ACP_REQUIRE_DB_TESTS is set but {what}");
+    }
+    eprintln!("SKIPPED: {what}");
+}
+
 pub async fn temp_database() -> Option<TempDb> {
     let Ok(url) = std::env::var("ACP_TEST_DATABASE_URL") else {
-        eprintln!("SKIPPED: set ACP_TEST_DATABASE_URL to run PostgreSQL-backed tests");
+        skip_or_fail("ACP_TEST_DATABASE_URL is not set (PostgreSQL-backed tests)");
         return None;
     };
     let admin = PgConnectOptions::from_str(&url).expect("valid ACP_TEST_DATABASE_URL");

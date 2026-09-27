@@ -349,7 +349,7 @@ fn free_port() -> u16 {
 #[tokio::test]
 async fn controller_end_to_end_on_a_real_apiserver() {
     let Ok(kubeconfig) = std::env::var("ACP_E2E_KUBECONFIG") else {
-        eprintln!("SKIPPED: set ACP_E2E_KUBECONFIG (scripts/envtest-up.sh) and ACP_TEST_DATABASE_URL");
+        acp_runner_journal::testing::skip_or_fail("ACP_E2E_KUBECONFIG is not set (scripts/envtest-up.sh)");
         return;
     };
     let Some(db) = acp_runner_journal::testing::temp_database().await else { return };

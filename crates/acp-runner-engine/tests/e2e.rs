@@ -707,6 +707,50 @@ async fn ingest_refuses_agent_sourced_authoritative_events_even_with_a_valid_tok
     h.done().await;
 }
 
+/// Review finding 3/4: a terminal report may only name the attempt's own artifact, and an
+/// agent cannot use a runner-owned progress category (base revision, environment phase, ...).
+#[tokio::test]
+async fn ingest_refuses_foreign_artifacts_and_runner_owned_categories() {
+    let Some(h) = H::new().await else { return };
+    // Run 1 produces an artifact that belongs to someone else from run 2's point of view.
+    let done = h.drive(&h.input(vec![h.class("fake-default", "fix")], 1), Duration::from_secs(60)).await;
+    assert_eq!(done.phase, RunPhase::Succeeded, "{done:?}");
+    let foreign = done.artifact.clone().expect("artifact").id;
+    // Run 2 hangs; we speak for its runnerd with its own token.
+    let input = h.input(vec![h.class("hang", "hang")], 1);
+    let start = Instant::now();
+    let v = loop {
+        let v = h.engine.reconcile(&input).await.unwrap();
+        if v.current.as_ref().is_some_and(|c| c.phase == AttemptPhase::Running) {
+            break v;
+        }
+        assert!(start.elapsed() < Duration::from_secs(30));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    let attempt_id = v.current.as_ref().unwrap().id;
+    let name = h.backend.names().into_iter().find(|n| n.contains(&attempt_id.to_string()[..8])).unwrap_or_else(|| h.backend.names().pop().unwrap());
+    let token = std::fs::read_to_string(h._tmp.path().join("sandboxes").join(&name).join("secret/token")).unwrap();
+    let url = format!("{}/v1/attempt/events", h.ingest_url);
+    let client = reqwest_like::Client::new();
+    for cat in ["workspace_ready", "gateway_listening", "environment_ready", "turn_ended", "snapshot_created"] {
+        let body = json!({"events": [{"seq": 910_000, "ts": "2026-09-26T00:00:00Z", "kind": "Progress", "source": "agent",
+                                       "data": {"category": cat, "message": "forged", "detail": {"baseRevision": "0".repeat(40)}}}]});
+        assert_eq!(client.post(&url, &token, &body.to_string()).await, 400, "{cat}");
+    }
+    let forged = json!({"events": [{"seq": 910_001, "ts": "2026-09-26T00:00:00Z", "kind": "AttemptCompleted", "source": "runnerd",
+                                     "data": {"stopReason": "end_turn", "artifactId": foreign}}]});
+    assert_eq!(client.post(&url, &token, &forged.to_string()).await, 200);
+    let a = h.engine.journal.get_attempt(attempt_id).await.unwrap();
+    assert_eq!(a.phase(), AttemptPhase::Failed, "a foreign artifact made the attempt succeed");
+    assert_eq!(a.artifact_id, None);
+    assert_eq!(a.failure().map(|f| f.code().to_string()).as_deref(), Some("ProtocolError"));
+    let v = h.drive(&input, Duration::from_secs(30)).await;
+    assert_ne!(v.artifact.map(|x| x.id), Some(foreign));
+    // The database refuses the link as well, whoever writes it.
+    assert!(h.engine.journal.set_attempt_details(attempt_id, None, None, Some(foreign)).await.is_err());
+    h.done().await;
+}
+
 /// Minimal HTTP client on hyper-less std TCP to avoid another dev-dependency.
 mod reqwest_like {
     use std::io::{Read, Write};

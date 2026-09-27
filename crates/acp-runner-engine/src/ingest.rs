@@ -298,6 +298,12 @@ async fn post_events(
         if matches!(ev.source, EventSource::Agent | EventSource::Driver) && !ev.kind.agent_may_emit() {
             return Err(ApiError(StatusCode::BAD_REQUEST, format!("agent-sourced {} is not accepted", ev.kind)));
         }
+        if matches!(ev.source, EventSource::Agent | EventSource::Driver)
+            && ev.kind == EventKind::Progress
+            && ev.data.get("category").and_then(|c| c.as_str()).is_some_and(acp_runner_core::events::is_runner_owned_category)
+        {
+            return Err(ApiError(StatusCode::BAD_REQUEST, "agent-sourced progress uses a runner-owned category".into()));
+        }
         if ev.seq.is_none() {
             return Err(ApiError(StatusCode::BAD_REQUEST, "events must carry seq".into()));
         }
@@ -335,7 +341,9 @@ async fn post_events(
         }
     }
     if let Some(rev) = batch.events.iter().find_map(|e| {
-        (e.kind == EventKind::Progress && e.data.get("category").and_then(|c| c.as_str()) == Some("workspace_ready"))
+        (e.kind == EventKind::Progress
+            && e.source == EventSource::Runnerd
+            && e.data.get("category").and_then(|c| c.as_str()) == Some("workspace_ready"))
             .then(|| e.data.pointer("/detail/baseRevision").and_then(|r| r.as_str()).map(str::to_string))
             .flatten()
     }) && acp_runner_core::spec::is_safe_revision(&rev)
@@ -343,14 +351,27 @@ async fn post_events(
         st.journal.set_attempt_details(a.id, None, Some(&rev), None).await?;
     }
     if let Some(term) = batch.events.iter().find(|e| e.kind.is_attempt_terminal()) {
-        let data: AttemptTerminalData = serde_json::from_value(term.data.clone()).unwrap_or(AttemptTerminalData {
+        let mut data: AttemptTerminalData = serde_json::from_value(term.data.clone()).unwrap_or(AttemptTerminalData {
             reason: Some(FailureReason::internal("unparseable terminal event")),
             stop_reason: None,
             summary: None,
             artifact_id: None,
         });
+        // The artifact a terminal report names must be one this attempt uploaded itself;
+        // otherwise a runner could make its run point at another run's patch.
+        let mut foreign = false;
+        if let Some(id) = data.artifact_id
+            && !artifact_belongs_to(&st, id, &a).await?
+        {
+            tracing::warn!(attempt_id = %a.id, artifact_id = %id, "terminal report names a foreign artifact");
+            foreign = true;
+            data.artifact_id = None;
+            data.reason = Some(FailureReason::ProtocolError {
+                detail: "terminal report names an artifact that this attempt did not upload".into(),
+            });
+        }
         let phase = match term.kind {
-            EventKind::AttemptCompleted => AttemptPhase::Succeeded,
+            EventKind::AttemptCompleted if !foreign => AttemptPhase::Succeeded,
             EventKind::AttemptTimedOut => AttemptPhase::TimedOut,
             _ => match &data.reason {
                 Some(FailureReason::Cancelled { .. }) => AttemptPhase::Cancelled,
@@ -378,6 +399,15 @@ async fn post_events(
         }
     }
     Ok(Json(Accepted { accepted }))
+}
+
+/// Does artifact `id` exist and belong to attempt `a` (same run, same attempt)?
+async fn artifact_belongs_to(st: &IngestState, id: Uuid, a: &AttemptRow) -> ApiResult<bool> {
+    match st.artifacts.get_meta(id).await {
+        Ok(m) => Ok(m.attempt_id == a.id && m.run_id == a.run_id),
+        Err(JournalError::NotFound(_)) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
 }
 
 async fn post_heartbeat(

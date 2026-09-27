@@ -279,6 +279,8 @@ async fn proxy_egress_blocks_arbitrary_hosts_and_allows_the_allowlist() {
         eprintln!("SKIPPED: namespaces unavailable (needs root + util-linux)");
         return;
     }
+    // The proxy binary is spawned below; do not rely on another test having built it.
+    build();
     // A host-side "allowed provider" that accepts a TCP connection.
     let provider = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let provider_port = provider.local_addr().unwrap().port();

@@ -755,6 +755,49 @@ impl Journal {
         })?)
     }
 
+    /// The latest runnerd-sourced progress event of each category in `categories` (at most
+    /// one row per category, oldest first). Agent-sourced events are never returned.
+    pub async fn latest_runner_progress(&self, attempt_id: Uuid, categories: &[&str]) -> Result<Vec<EventRow>> {
+        let mut rows: Vec<EventRow> = sqlx::query_as(
+            "SELECT DISTINCT ON (data->>'category') * FROM session_events
+             WHERE attempt_id = $1 AND kind = 'Progress' AND source = 'runnerd' AND data->>'category' = ANY($2)
+             ORDER BY data->>'category', id DESC",
+        )
+        .bind(attempt_id)
+        .bind(categories)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.sort_by_key(|r| r.id);
+        Ok(rows)
+    }
+
+    /// runnerd-sourced progress events whose `detail.<key>` equals `value`, oldest first.
+    pub async fn runner_progress_with_detail(&self, attempt_id: Uuid, key: &str, value: &str) -> Result<Vec<EventRow>> {
+        Ok(sqlx::query_as(
+            "SELECT * FROM session_events
+             WHERE attempt_id = $1 AND kind = 'Progress' AND source = 'runnerd' AND data->'detail'->>$2 = $3
+             ORDER BY id",
+        )
+        .bind(attempt_id)
+        .bind(key)
+        .bind(value)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// The latest terminal attempt event reported by runnerd or the controller.
+    pub async fn latest_terminal_event(&self, attempt_id: Uuid) -> Result<Option<EventRow>> {
+        Ok(sqlx::query_as(
+            "SELECT * FROM session_events
+             WHERE attempt_id = $1 AND kind IN ('AttemptCompleted', 'AttemptFailed', 'AttemptTimedOut')
+               AND source IN ('runnerd', 'controller')
+             ORDER BY id DESC LIMIT 1",
+        )
+        .bind(attempt_id)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
     pub async fn count_events(&self, attempt_id: Uuid, kind: EventKind) -> Result<i64> {
         Ok(sqlx::query_scalar("SELECT count(*) FROM session_events WHERE attempt_id = $1 AND kind = $2")
             .bind(attempt_id)

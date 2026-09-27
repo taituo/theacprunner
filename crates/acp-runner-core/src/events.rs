@@ -288,12 +288,46 @@ pub struct ProgressData {
     pub detail: serde_json::Value,
 }
 
+/// Progress categories the controller acts on (environment phase, connection reference,
+/// base revision, snapshots). Only runnerd may emit them: runnerd renames an agent-sourced
+/// progress event with one of these categories to `agent.<category>`, the ingest API refuses
+/// agent-sourced ones, and every consumer additionally requires `source = runnerd`.
+pub const RUNNER_OWNED_CATEGORIES: &[&str] = &[
+    "workspace_ready",
+    "gateway_listening",
+    "environment_ready",
+    "environment_busy",
+    "turn_ended",
+    "snapshot_created",
+    "snapshot_rejected",
+    "snapshot_failed",
+    "credential_writeback",
+    "credential_writeback_failed",
+    "directive_ack",
+];
+
+/// Is `category` reserved for runnerd (see [`RUNNER_OWNED_CATEGORIES`])?
+pub fn is_runner_owned_category(category: &str) -> bool {
+    RUNNER_OWNED_CATEGORIES.contains(&category)
+}
+
+/// The category an agent-sourced progress event is journaled under: reserved categories get
+/// an `agent.` prefix so they can never be mistaken for runnerd's authoritative reports.
+pub fn agent_progress_category(category: &str) -> String {
+    if is_runner_owned_category(category) { format!("agent.{category}") } else { category.to_string() }
+}
+
 impl ProgressData {
     pub fn new(category: impl Into<String>, message: impl Into<String>) -> Self {
         ProgressData { category: category.into(), message: message.into(), detail: serde_json::Value::Null }
     }
     pub fn with_detail(mut self, detail: serde_json::Value) -> Self {
         self.detail = detail;
+        self
+    }
+    /// Rename a reserved category (agent-sourced events only).
+    pub fn into_agent_owned(mut self) -> Self {
+        self.category = agent_progress_category(&self.category);
         self
     }
 }
