@@ -406,6 +406,12 @@ impl EnvironmentSpec {
         if self.workspace.overlays.len() > MAX_OVERLAYS {
             return Err(inv("workspace.overlays", format!("at most {MAX_OVERLAYS}")));
         }
+        // Artifacts are cumulative against the original base: applying two of them in a row
+        // would promise merge semantics that are not defined. One PatchArtifact restores any
+        // earlier state; the list stays a list for future overlay kinds.
+        if self.workspace.overlays.iter().filter(|o| matches!(o, WorkspaceOverlay::PatchArtifact { .. })).count() > 1 {
+            return Err(inv("workspace.overlays", "at most one patchArtifact overlay".to_string()));
+        }
         self.workdir()?;
         for p in &self.workspace.policy.allowed_paths {
             validate_relative_path(p).map_err(|err| SpecError::BadAllowedPath { path: p.clone(), err })?;
@@ -727,6 +733,10 @@ mod tests {
         assert_eq!(s.configs, vec!["company-claude-project".to_string()]);
         assert_eq!(s.workspace.overlays[0].artifact_id().to_string(), "0192f5f0-0000-7000-8000-000000000001");
         assert_eq!(s.workspace.policy.max_patch_bytes, 1000);
+        // two cumulative patch overlays would promise undefined merge semantics
+        let mut two = s.clone();
+        two.workspace.overlays.push(two.workspace.overlays[0].clone());
+        assert!(two.validate().unwrap_err().to_string().contains("patchArtifact"));
         assert_eq!(s.bootstrap.files[0].artifact_policy, ArtifactPolicy::Exclude);
         assert!(!s.produces_artifact());
         assert_eq!(s.idle_seconds(), Some(600));

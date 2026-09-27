@@ -113,6 +113,7 @@ pub fn is_public(ip: IpAddr) -> bool {
                 || (o[0] == 100 && (64..=127).contains(&o[1])) // CGNAT
                 || (o[0] == 192 && o[1] == 0 && o[2] == 0) // IETF protocol assignments
                 || (o[0] == 198 && (18..=19).contains(&o[1])) // benchmarking
+                || (o[0] == 192 && o[1] == 88 && o[2] == 99) // 6to4 relay anycast
                 || o[0] >= 240)
         }
         IpAddr::V6(v6) => {
@@ -120,11 +121,29 @@ pub fn is_public(ip: IpAddr) -> bool {
                 return is_public(IpAddr::V4(v4));
             }
             let s = v6.segments();
+            let o = v6.octets();
+            let embedded_v4 = |i: usize| IpAddr::V4(std::net::Ipv4Addr::new(o[i], o[i + 1], o[i + 2], o[i + 3]));
+            // Translation prefixes carry an IPv4 destination: judge that address instead.
+            if s[0] == 0x0064 && s[1] == 0xff9b && s[2..6] == [0, 0, 0, 0] {
+                return is_public(embedded_v4(12)); // NAT64 well-known 64:ff9b::/96
+            }
+            if s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 0x0001 {
+                return false; // local-use NAT64 64:ff9b:1::/48 (RFC 8215): never public
+            }
+            if s[0] == 0x2002 {
+                return is_public(embedded_v4(2)); // 6to4 2002:V4ADDR::/48
+            }
+            if s[..6] == [0, 0, 0, 0, 0, 0] {
+                return false; // deprecated IPv4-compatible ::a.b.c.d (and ::, ::1)
+            }
             !(v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
                 || (s[0] & 0xfe00) == 0xfc00 // ULA
                 || (s[0] & 0xffc0) == 0xfe80 // link-local
+                || (s[0] & 0xffc0) == 0xfec0 // site-local (deprecated)
+                || (s[0] == 0x2001 && s[1] == 0x0000) // Teredo 2001::/32
+                || (s[0] == 0x0100 && s[1..4] == [0, 0, 0]) // discard-only 100::/64
                 || (s[0] == 0x2001 && s[1] == 0x0db8)) // documentation
         }
     }
@@ -158,8 +177,16 @@ impl ProxyConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
-    Allow { host: String, port: u16, addr: SocketAddr },
-    Deny { status: u16, reason: String },
+    /// `addrs`: every resolved address (all public), tried in order.
+    Allow {
+        host: String,
+        port: u16,
+        addrs: Vec<SocketAddr>,
+    },
+    Deny {
+        status: u16,
+        reason: String,
+    },
 }
 
 fn deny(status: u16, reason: impl Into<String>) -> Decision {
@@ -207,7 +234,7 @@ pub async fn decide(cfg: &ProxyConfig, head: &str) -> (Decision, String, String)
     if !cfg.allow_private && addrs.iter().any(|a| !is_public(a.ip())) {
         return (deny(403, "host resolves to a non-public address"), method, target);
     }
-    (Decision::Allow { host, port, addr: addrs[0] }, method, target)
+    (Decision::Allow { host, port, addrs }, method, target)
 }
 
 async fn read_head<S: AsyncRead + Unpin>(s: &mut S) -> std::io::Result<(String, Vec<u8>)> {
@@ -275,7 +302,7 @@ where
         }
     };
     let (decision, method, target) = decide(&cfg, &head).await;
-    let (host, port, addr) = match decision {
+    let (host, port, addrs) = match decision {
         Decision::Deny { status, reason } => {
             let text = match status {
                 400 => "Bad Request",
@@ -301,11 +328,17 @@ where
             });
             return;
         }
-        Decision::Allow { host, port, addr } => (host, port, addr),
+        Decision::Allow { host, port, addrs } => (host, port, addrs),
     };
-    let upstream = match tokio::time::timeout(cfg.connect_timeout, TcpStream::connect(addr)).await {
-        Ok(Ok(s)) => s,
-        _ => {
+    // Try every resolved (already vetted) address in order: an IPv6-first answer must not
+    // break clusters without IPv6 egress. The connect timeout is shared by all attempts.
+    let connected = connect_first(&addrs, cfg.connect_timeout).await;
+    let upstream = match connected {
+        Some((s, used)) => {
+            tracing::debug!(target: "acp_egress", addr = %used, "upstream connected");
+            s
+        }
+        None => {
             let _ =
                 client.write_all(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n").await;
             log(LogEntry {
@@ -333,11 +366,9 @@ where
         }
         up += leftover.len() as u64;
     }
-    let res = tokio::time::timeout(cfg.max_tunnel, tokio::io::copy_bidirectional(&mut client, &mut upstream)).await;
-    let (u, d) = match res {
-        Ok(Ok((u, d))) => (u, d),
-        _ => (0, 0),
-    };
+    let counters = Counters::default();
+    let _ = tokio::time::timeout(cfg.max_tunnel, copy_counted(&mut client, &mut upstream, &counters)).await;
+    let (u, d) = counters.get();
     log(LogEntry {
         peer: &peer,
         method: &method,
@@ -348,6 +379,70 @@ where
         down: d,
         started,
     });
+}
+
+/// Connect to the first address that accepts within the shared `timeout`.
+pub async fn connect_first(addrs: &[SocketAddr], timeout: Duration) -> Option<(TcpStream, SocketAddr)> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    for a in addrs {
+        match tokio::time::timeout_at(deadline, TcpStream::connect(a)).await {
+            Ok(Ok(s)) => return Some((s, *a)),
+            Ok(Err(_)) => continue,
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+#[derive(Default)]
+struct Counters {
+    up: std::sync::atomic::AtomicU64,
+    down: std::sync::atomic::AtomicU64,
+}
+
+impl Counters {
+    fn get(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (self.up.load(Relaxed), self.down.load(Relaxed))
+    }
+}
+
+/// Bidirectional copy that counts bytes as they flow, so the log line is right even when the
+/// tunnel is cut by `max_tunnel`.
+async fn copy_counted<A, B>(a: &mut A, b: &mut B, c: &Counters) -> std::io::Result<()>
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    use std::sync::atomic::Ordering::Relaxed;
+    let (mut ar, mut aw) = tokio::io::split(a);
+    let (mut br, mut bw) = tokio::io::split(b);
+    let up = async {
+        let mut buf = vec![0u8; 32 * 1024];
+        loop {
+            let n = ar.read(&mut buf).await?;
+            if n == 0 {
+                let _ = bw.shutdown().await;
+                return Ok::<_, std::io::Error>(());
+            }
+            bw.write_all(&buf[..n]).await?;
+            c.up.fetch_add(n as u64, Relaxed);
+        }
+    };
+    let down = async {
+        let mut buf = vec![0u8; 32 * 1024];
+        loop {
+            let n = br.read(&mut buf).await?;
+            if n == 0 {
+                let _ = aw.shutdown().await;
+                return Ok::<_, std::io::Error>(());
+            }
+            aw.write_all(&buf[..n]).await?;
+            c.down.fetch_add(n as u64, Relaxed);
+        }
+    };
+    let (r1, r2) = tokio::join!(up, down);
+    r1.and(r2)
 }
 
 /// Serve TCP clients until the listener fails.
@@ -463,12 +558,34 @@ mod tests {
             "fe80::1",
             "::ffff:10.0.0.1",
             "224.0.0.1",
+            "64:ff9b::a00:1",     // NAT64 -> 10.0.0.1
+            "64:ff9b::a9fe:a9fe", // NAT64 -> 169.254.169.254
+            "64:ff9b:1::1",       // local-use NAT64
+            "2002:a00:1::1",      // 6to4 -> 10.0.0.1
+            "2001:0:1::1",        // Teredo
+            "fec0::1",            // site-local
+            "100::1",             // discard
+            "::a00:1",            // IPv4-compatible
+            "192.88.99.1",
         ] {
             assert!(!is_public(ip.parse().unwrap()), "{ip}");
         }
-        for ip in ["1.1.1.1", "140.82.112.3", "2606:4700::1111"] {
+        for ip in ["1.1.1.1", "140.82.112.3", "2606:4700::1111", "64:ff9b::101:101", "2002:101:101::1"] {
             assert!(is_public(ip.parse().unwrap()), "{ip}");
         }
+    }
+
+    #[tokio::test]
+    async fn falls_back_to_the_next_resolved_address() {
+        let open = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let good = open.local_addr().unwrap();
+        let closed = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap()
+        }; // dropped: nothing listens there any more
+        let (_, used) = connect_first(&[closed, good], Duration::from_secs(5)).await.expect("fallback");
+        assert_eq!(used, good);
+        assert!(connect_first(&[closed], Duration::from_secs(5)).await.is_none());
     }
 
     #[tokio::test]

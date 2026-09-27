@@ -96,6 +96,7 @@ async fn openai_responses_over_acp() {
         EnvironmentConfig {
             ingest_url: format!("http://{ingest_addr}"),
             require_egress_proxy_for_credentials: false,
+            allow_file_repositories: true,
             ..Default::default()
         },
     ));

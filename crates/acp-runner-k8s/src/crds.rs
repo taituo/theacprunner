@@ -241,6 +241,9 @@ pub struct RunOutput {
     pub require_changes: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_patch_bytes: Option<u64>,
+    /// Accept gitlinks and `.gitmodules` changes (default false).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_submodules: Option<bool>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, JsonSchema, PartialEq, Default)]
@@ -431,6 +434,7 @@ impl ACPRunSpec {
                 },
                 require_changes: out.require_changes.unwrap_or(true),
                 max_patch_bytes: out.max_patch_bytes,
+                allow_submodules: out.allow_submodules.unwrap_or(false),
             },
             retry: core::RetryPolicy {
                 max_attempts_per_runner: retry.max_attempts_per_runner.unwrap_or(1),

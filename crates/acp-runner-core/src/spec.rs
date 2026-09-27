@@ -68,11 +68,20 @@ pub struct OutputExpectation {
     /// Overrides the runner class limit when smaller.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_patch_bytes: Option<u64>,
+    /// Accept gitlinks (nested repositories) and `.gitmodules` changes in the patch.
+    /// Off by default: a submodule entry points the consumer at another repository.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_submodules: bool,
 }
 
 impl Default for OutputExpectation {
     fn default() -> Self {
-        OutputExpectation { kind: OutputKind::Patch, require_changes: true, max_patch_bytes: None }
+        OutputExpectation {
+            kind: OutputKind::Patch,
+            require_changes: true,
+            max_patch_bytes: None,
+            allow_submodules: false,
+        }
     }
 }
 
@@ -472,6 +481,11 @@ impl RunSpec {
 
 /// Conservative git revision check: a SHA or a ref name, never something git could parse
 /// as an option.
+/// `file://` repository URL (fixtures inside the runner image; opt-in at the controller).
+pub fn is_file_url(url: &str) -> bool {
+    url.trim().get(..7).is_some_and(|p| p.eq_ignore_ascii_case("file://"))
+}
+
 pub fn is_safe_revision(rev: &str) -> bool {
     !rev.is_empty()
         && rev.len() <= 255

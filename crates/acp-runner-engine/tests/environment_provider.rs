@@ -117,6 +117,7 @@ impl H {
             gateway_listen: "127.0.0.1:0".into(),
             require_egress_proxy_for_credentials: false,
             runner_image: "local".into(),
+            allow_file_repositories: true,
             ..Default::default()
         };
         let bundles = Arc::new(StaticBundleProvider::default());

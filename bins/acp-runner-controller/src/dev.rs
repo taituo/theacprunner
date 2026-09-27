@@ -114,6 +114,8 @@ pub async fn dev_run(args: DevRunArgs) -> anyhow::Result<()> {
             waiting_requeue: Duration::from_secs(2),
             record_raw_payloads: args.common.record_raw,
             require_egress_proxy_for_credentials: !args.allow_direct_credential_egress,
+            // dev-run clones local fixture repositories
+            allow_file_repositories: true,
             ..Default::default()
         },
     };

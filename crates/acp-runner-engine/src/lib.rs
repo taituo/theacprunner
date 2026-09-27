@@ -77,6 +77,9 @@ pub struct EngineConfig {
     /// Runner classes with persistent subscription credentials must use
     /// `egress.mode: proxy`. Disable only for local development.
     pub require_egress_proxy_for_credentials: bool,
+    /// Accept `file://` repository URLs. They make runnerd (trusted container) read a
+    /// repository from its own filesystem; meant for fixtures baked into the runner image.
+    pub allow_file_repositories: bool,
 }
 
 impl Default for EngineConfig {
@@ -90,6 +93,7 @@ impl Default for EngineConfig {
             record_raw_payloads: true,
             credential_lease_margin: Duration::from_secs(300),
             require_egress_proxy_for_credentials: true,
+            allow_file_repositories: false,
         }
     }
 }
@@ -258,6 +262,13 @@ impl Engine {
                  proxy; set egress.mode: proxy with an allowlisting egress proxy (development only: \
                  ACP_RUNNER_ALLOW_DIRECT_CREDENTIAL_EGRESS=true)"
             );
+            self.fail_run(&run, FailureReason::Unsupported { detail }).await?;
+            return Ok(Duration::ZERO);
+        }
+        if !self.cfg.allow_file_repositories && acp_runner_core::spec::is_file_url(&spec.repository.url) {
+            let detail = "file:// repository URLs are disabled (ACP_RUNNER_ALLOW_FILE_REPOS=true enables them for \
+                          fixtures baked into the runner image)"
+                .to_string();
             self.fail_run(&run, FailureReason::Unsupported { detail }).await?;
             return Ok(Duration::ZERO);
         }
@@ -615,6 +626,7 @@ impl Engine {
                 require_changes: spec.output.require_changes,
                 max_patch_bytes: spec.effective_max_patch_bytes(class),
                 allowed_paths: class.workspace.allowed_paths.clone(),
+                allow_submodules: spec.output.allow_submodules,
             },
             timeouts: t,
             permissions: class.permissions,

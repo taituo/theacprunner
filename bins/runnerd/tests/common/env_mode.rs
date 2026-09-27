@@ -38,6 +38,7 @@ pub fn env_spec(env: &TestEnv, environment_id: Uuid) -> AttemptSpec {
             require_changes: false,
             max_patch_bytes: 1 << 20,
             allowed_paths: vec![],
+            allow_submodules: false,
         },
         timeouts: TimeoutPolicy {
             hard_seconds: 120,

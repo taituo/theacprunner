@@ -199,6 +199,8 @@ pub struct AttemptOutput {
     pub max_patch_bytes: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_submodules: bool,
 }
 
 /// Where the leased credential material appears and how the CLI receives it.

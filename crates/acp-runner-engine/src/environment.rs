@@ -67,6 +67,8 @@ pub struct EnvironmentConfig {
     /// Credential leases of environments expire this long after the last runnerd heartbeat
     /// (each heartbeat extends them); released explicitly when the environment ends.
     pub credential_lease_window: Duration,
+    /// Accept `file://` workspace sources (see `EngineConfig::allow_file_repositories`).
+    pub allow_file_repositories: bool,
 }
 
 /// The provider's ticket master key (never printed).
@@ -122,6 +124,7 @@ impl Default for EnvironmentConfig {
             ticket_key: random_ticket_key(),
             ticket_ttl_seconds: ticket::DEFAULT_TICKET_TTL_SECONDS,
             credential_lease_window: Duration::from_secs(15 * 60),
+            allow_file_repositories: false,
         }
     }
 }
@@ -476,6 +479,11 @@ impl EnvironmentProvider {
                 "environment uses persistent credentials but egress.mode is not proxy; set egress.mode: proxy"
             );
         }
+        if !self.cfg.allow_file_repositories
+            && spec.workspace.source.as_ref().is_some_and(|s| acp_runner_core::spec::is_file_url(&s.repository().url))
+        {
+            anyhow::bail!("file:// workspace sources are disabled (ACP_RUNNER_ALLOW_FILE_REPOS=true enables them)");
+        }
         let workdir = spec.workdir()?;
         let harness = self.resolve_harness(&spec).await?;
         let driver = harness.as_ref().map(|h| h.adapter.clone()).unwrap_or_else(|| spec.harness.name.clone());
@@ -544,6 +552,7 @@ impl EnvironmentProvider {
                 require_changes: false,
                 max_patch_bytes: spec.workspace.policy.max_patch_bytes,
                 allowed_paths: spec.workspace.policy.allowed_paths.clone(),
+                allow_submodules: false,
             },
             timeouts: t,
             permissions: spec.permissions,

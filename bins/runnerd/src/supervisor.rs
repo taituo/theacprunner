@@ -703,6 +703,7 @@ pub async fn run_attempt(
             allowed_paths: spec.output.allowed_paths.clone(),
             reject_symlink_escape: true,
             exclude_paths: vec![],
+            allow_submodules: spec.output.allow_submodules,
         };
         let collected =
             with_heartbeats(&mut em, hb_every, tokio::time::timeout(COLLECT_TIMEOUT, collect_patch(&ws, &copts)))
@@ -920,6 +921,11 @@ async fn finish(
     // Hand refreshed credential files back (validated by the controller).
     if let Some(h) = home {
         for (key, bytes) in changed_writeback_files(&dirs.home, h) {
+            // Tokens refreshed during the run are unknown literals so far: register them
+            // before anything else (write-back errors, final events) is journaled.
+            if let Ok(text) = std::str::from_utf8(&bytes) {
+                em.redactor.add_secret(text);
+            }
             match em.sink.writeback(&key, &bytes).await {
                 Ok(()) => {
                     em.progress("credential_writeback", &format!("refreshed {key} handed back"), Value::Null).await

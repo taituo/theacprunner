@@ -113,6 +113,7 @@ impl H {
                 ingest_url: format!("http://{ingest_addr}"),
                 active_requeue: Duration::from_millis(200),
                 waiting_requeue: Duration::from_millis(300),
+                allow_file_repositories: true,
                 ..Default::default()
             },
         });

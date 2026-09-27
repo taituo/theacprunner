@@ -426,6 +426,7 @@ async fn controller_end_to_end_on_a_real_apiserver() {
         .env("ACP_RUNNER_WATCH_NAMESPACE", &ns)
         .env("ACP_RUNNER_CREDENTIAL_NAMESPACE", &ns)
         .env("ACP_RUNNER_STRICT_POSTURE", "false")
+        .env("ACP_RUNNER_ALLOW_FILE_REPOS", "true")
         .env("RUST_LOG", "info")
         .stdout(log.try_clone().unwrap())
         .stderr(log)

@@ -90,6 +90,7 @@ impl H {
             // has no egress proxy; the proxy requirement is exercised by the isolation and
             // kube_e2e suites.
             require_egress_proxy_for_credentials: false,
+            allow_file_repositories: true,
             ..Default::default()
         };
         tune(&mut cfg);
@@ -728,7 +729,12 @@ async fn ingest_refuses_foreign_artifacts_and_runner_owned_categories() {
         tokio::time::sleep(Duration::from_millis(200)).await;
     };
     let attempt_id = v.current.as_ref().unwrap().id;
-    let name = h.backend.names().into_iter().find(|n| n.contains(&attempt_id.to_string()[..8])).unwrap_or_else(|| h.backend.names().pop().unwrap());
+    let name = h
+        .backend
+        .names()
+        .into_iter()
+        .find(|n| n.contains(&attempt_id.to_string()[..8]))
+        .unwrap_or_else(|| h.backend.names().pop().unwrap());
     let token = std::fs::read_to_string(h._tmp.path().join("sandboxes").join(&name).join("secret/token")).unwrap();
     let url = format!("{}/v1/attempt/events", h.ingest_url);
     let client = reqwest_like::Client::new();
@@ -748,6 +754,16 @@ async fn ingest_refuses_foreign_artifacts_and_runner_owned_categories() {
     assert_ne!(v.artifact.map(|x| x.id), Some(foreign));
     // The database refuses the link as well, whoever writes it.
     assert!(h.engine.journal.set_attempt_details(attempt_id, None, None, Some(foreign)).await.is_err());
+    h.done().await;
+}
+
+#[tokio::test]
+async fn file_repositories_are_refused_unless_enabled() {
+    let Some(h) = H::with(|c| c.allow_file_repositories = false, 8 * 1024 * 1024).await else { return };
+    let v = h.drive(&h.input(vec![h.class("fake-default", "fix")], 1), Duration::from_secs(30)).await;
+    assert_eq!(v.phase, RunPhase::Failed, "{v:?}");
+    assert_eq!(v.attempt_count, 0);
+    assert!(v.failure.unwrap().message().contains("file://"));
     h.done().await;
 }
 

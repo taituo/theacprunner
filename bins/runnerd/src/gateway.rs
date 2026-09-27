@@ -39,6 +39,9 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::{Role, WebSocketConfig};
 use uuid::Uuid;
 
+/// Upper bound for concurrent connections that have not finished the HTTP handshake.
+pub const MAX_PENDING_HANDSHAKES: usize = 32;
+
 pub struct GatewayConfig {
     pub listen: String,
     pub environment_id: Uuid,
@@ -106,10 +109,23 @@ impl Gateway {
         tokio::spawn(async move {
             let nonces: Arc<Mutex<HashMap<String, i64>>> = Arc::default();
             let ids = Arc::new(AtomicU64::new(1));
+            // Bound concurrent unauthenticated handshakes (each may linger up to 15 s).
+            let slots = Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_HANDSHAKES));
             while let Ok((stream, _peer)) = self.listener.accept().await {
+                let Ok(permit) = slots.clone().try_acquire_owned() else {
+                    drop(stream);
+                    let _ = out
+                        .send(GatewayEvent::Rejected(Rejection {
+                            status: 503,
+                            reason: "too many pending handshakes".into(),
+                        }))
+                        .await;
+                    continue;
+                };
                 let (cfg, nonces, phase, out, ids) =
                     (self.cfg.clone(), nonces.clone(), phase.clone(), out.clone(), ids.clone());
                 tokio::spawn(async move {
+                    let _permit = permit;
                     match tokio::time::timeout(Duration::from_secs(15), handshake(stream, &cfg, &nonces, &phase)).await
                     {
                         Ok(Ok(Some(conn))) => {
@@ -250,6 +266,13 @@ async fn handshake(
             return Err(reject(status, &reason));
         }
     };
+    // Phase first: a ticket presented while the environment cannot accept a caller is not
+    // consumed, so the client can retry with it once the environment is ready.
+    let ph = *phase.borrow();
+    if ph.is_terminal() || ph == EnvironmentPhase::Finishing || ph == EnvironmentPhase::Creating {
+        respond(&mut s, 409, &format!("environment is {ph}")).await;
+        return Err(reject(409, "environment not accepting connections"));
+    }
     let replayed = {
         let mut n = nonces.lock().expect("nonces");
         n.retain(|_, exp| *exp > now);
@@ -258,11 +281,6 @@ async fn handshake(
     if replayed {
         respond(&mut s, 401, "ticket already used").await;
         return Err(reject(401, "ticket already used"));
-    }
-    let ph = *phase.borrow();
-    if ph.is_terminal() || ph == EnvironmentPhase::Finishing || ph == EnvironmentPhase::Creating {
-        respond(&mut s, 409, &format!("environment is {ph}")).await;
-        return Err(reject(409, "environment not accepting connections"));
     }
     let upgrade = req.headers.get("upgrade").map(|u| u.to_ascii_lowercase()).unwrap_or_default();
     let extra = format!(
@@ -298,13 +316,15 @@ async fn handshake(
     Err(reject(426, "no supported upgrade"))
 }
 
-/// Make one line of newline-delimited JSON-RPC out of a WebSocket message (compact JSON if
-/// the frame contained raw newlines, which the stdio framing cannot carry).
+/// Make one line of newline-delimited JSON-RPC out of a WebSocket message without parsing it.
+/// In valid JSON a raw CR/LF can only be insignificant whitespace between tokens (inside a
+/// string it must be escaped), so replacing it with a space keeps the message exactly as sent
+/// otherwise: key order, number spelling, escapes and duplicate keys are untouched.
 fn ws_to_line(text: &str) -> Option<String> {
-    if !text.contains('\n') {
+    if !text.contains(['\n', '\r']) {
         return Some(text.to_string());
     }
-    serde_json::from_str::<serde_json::Value>(text).ok().map(|v| v.to_string())
+    Some(text.replace(['\n', '\r'], " "))
 }
 
 impl Conn {
@@ -332,7 +352,9 @@ impl Conn {
                             Ok(n) if n > MAX_MESSAGE_BYTES => break,
                             Ok(_) => {}
                         }
-                        let line = String::from_utf8_lossy(&buf).trim_end_matches(['\r', '\n']).to_string();
+                        // Relay unchanged or not at all (no lossy conversion).
+                        let Ok(text) = String::from_utf8(buf) else { break };
+                        let line = text.trim_end_matches(['\r', '\n']).to_string();
                         if line.trim().is_empty() {
                             continue;
                         }
@@ -363,7 +385,10 @@ impl Conn {
                     while let Some(Ok(m)) = stream.next().await {
                         let line = match m {
                             Message::Text(t) => ws_to_line(t.as_str()),
-                            Message::Binary(b) => ws_to_line(&String::from_utf8_lossy(&b)),
+                            Message::Binary(b) => match std::str::from_utf8(&b) {
+                                Ok(t) => ws_to_line(t),
+                                Err(_) => break,
+                            },
                             Message::Close(_) => break,
                             _ => continue,
                         };
@@ -386,9 +411,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn websocket_frames_become_single_lines() {
+    fn websocket_frames_become_single_lines_without_rewriting_json() {
         assert_eq!(ws_to_line(r#"{"a":1}"#).unwrap(), r#"{"a":1}"#);
-        assert_eq!(ws_to_line("{\n \"a\": 1\n}").unwrap(), r#"{"a":1}"#);
-        assert!(ws_to_line("not\njson").is_none());
+        assert_eq!(ws_to_line("{\n \"a\": 1\r\n}").unwrap(), "{  \"a\": 1  }");
+        // no canonicalization: key order, number spelling, escapes and duplicates survive
+        let odd = "{\"z\":1.50,\n\"a\":\"\\u00e4\",\"a\":2,\"n\":1e3}";
+        assert_eq!(ws_to_line(odd).unwrap(), odd.replace('\n', " "));
     }
 }

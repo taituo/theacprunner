@@ -353,6 +353,9 @@ pub struct ChangedPath {
     pub is_symlink: bool,
     #[serde(default)]
     pub is_binary: bool,
+    /// git file mode after the change (`100644`, `100755`, `120000`, ...); absent for deletions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

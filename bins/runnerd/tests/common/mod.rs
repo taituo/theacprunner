@@ -298,6 +298,7 @@ impl TestEnv {
                 require_changes: true,
                 max_patch_bytes: 1 << 20,
                 allowed_paths: vec![],
+                allow_submodules: false,
             },
             timeouts: TimeoutPolicy {
                 hard_seconds: if live { 900 } else { 60 },

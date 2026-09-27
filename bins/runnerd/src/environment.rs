@@ -230,6 +230,7 @@ pub async fn run_environment(
         allowed_paths: spec.output.allowed_paths.clone(),
         exclude: vec![],
         produce_artifact: plan.produce_artifact,
+        allow_submodules: spec.output.allow_submodules,
     };
     macro_rules! fail_early {
         ($reason:expr) => {
@@ -611,7 +612,13 @@ fn spawn_data_link(data: tokio::net::UnixStream) -> (mpsc::Receiver<String>, mps
                 Ok(n) if n > max => break,
                 Ok(_) => {}
             }
-            let line = String::from_utf8_lossy(&buf).trim_end_matches(['\r', '\n']).to_string();
+            // ACP is UTF-8 JSON-RPC: relay the bytes unchanged (framing aside) or not at all.
+            // A lossy conversion would silently alter the harness's message.
+            let Ok(text) = String::from_utf8(buf) else {
+                tracing::warn!("harness sent a non-UTF-8 line; closing the data link");
+                break;
+            };
+            let line = text.trim_end_matches(['\r', '\n']).to_string();
             if line.trim().is_empty() {
                 continue;
             }
@@ -736,6 +743,7 @@ struct CollectCfg {
     exclude: Vec<String>,
     /// Output policy `none` → no final artifact.
     produce_artifact: bool,
+    allow_submodules: bool,
 }
 
 impl CollectCfg {
@@ -745,6 +753,7 @@ impl CollectCfg {
             allowed_paths: self.allowed_paths.clone(),
             reject_symlink_escape: true,
             exclude_paths: self.exclude.clone(),
+            allow_submodules: self.allow_submodules,
         }
     }
 }
@@ -824,6 +833,11 @@ async fn finish_now(
     // credential write-back (validated by the controller)
     if let Some(h) = home {
         for (key, bytes) in changed_writeback_files(&dirs.home, h) {
+            // Tokens refreshed during the run are unknown literals so far: register them
+            // before anything else (write-back errors, final events) is journaled.
+            if let Ok(text) = std::str::from_utf8(&bytes) {
+                em.redactor.add_secret(text);
+            }
             match em.sink.writeback(&key, &bytes).await {
                 Ok(()) => {
                     em.progress("credential_writeback", &format!("refreshed {key} handed back"), Value::Null).await

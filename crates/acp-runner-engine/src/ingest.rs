@@ -300,9 +300,16 @@ async fn post_events(
         }
         if matches!(ev.source, EventSource::Agent | EventSource::Driver)
             && ev.kind == EventKind::Progress
-            && ev.data.get("category").and_then(|c| c.as_str()).is_some_and(acp_runner_core::events::is_runner_owned_category)
+            && ev
+                .data
+                .get("category")
+                .and_then(|c| c.as_str())
+                .is_some_and(acp_runner_core::events::is_runner_owned_category)
         {
-            return Err(ApiError(StatusCode::BAD_REQUEST, "agent-sourced progress uses a runner-owned category".into()));
+            return Err(ApiError(
+                StatusCode::BAD_REQUEST,
+                "agent-sourced progress uses a runner-owned category".into(),
+            ));
         }
         if ev.seq.is_none() {
             return Err(ApiError(StatusCode::BAD_REQUEST, "events must carry seq".into()));
@@ -344,8 +351,8 @@ async fn post_events(
         (e.kind == EventKind::Progress
             && e.source == EventSource::Runnerd
             && e.data.get("category").and_then(|c| c.as_str()) == Some("workspace_ready"))
-            .then(|| e.data.pointer("/detail/baseRevision").and_then(|r| r.as_str()).map(str::to_string))
-            .flatten()
+        .then(|| e.data.pointer("/detail/baseRevision").and_then(|r| r.as_str()).map(str::to_string))
+        .flatten()
     }) && acp_runner_core::spec::is_safe_revision(&rev)
     {
         st.journal.set_attempt_details(a.id, None, Some(&rev), None).await?;

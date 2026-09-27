@@ -109,6 +109,9 @@ pub struct RunArgs {
     /// `egress.mode: direct` (unrestricted public egress).
     #[arg(long, env = "ACP_RUNNER_ALLOW_DIRECT_CREDENTIAL_EGRESS", default_value_t = false, action = clap::ArgAction::Set)]
     pub allow_direct_credential_egress: bool,
+    /// Accept `file://` repository URLs (fixtures baked into the runner image).
+    #[arg(long, env = "ACP_RUNNER_ALLOW_FILE_REPOS", default_value_t = false, action = clap::ArgAction::Set)]
+    pub allow_file_repos: bool,
 }
 
 pub fn init_tracing() {
@@ -198,6 +201,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
             ingest_url: args.ingest_url.clone(),
             record_raw_payloads: args.common.record_raw,
             require_egress_proxy_for_credentials: !args.allow_direct_credential_egress,
+            allow_file_repositories: args.allow_file_repos,
             ..Default::default()
         },
     });

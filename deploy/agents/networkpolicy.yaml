@@ -78,12 +78,22 @@ spec:
               - 169.254.0.0/16
               - 127.0.0.0/8
               - 0.0.0.0/8
+              - 192.0.0.0/24      # IETF protocol assignments
+              - 192.88.99.0/24    # 6to4 relay anycast
+              - 198.18.0.0/15     # benchmarking
+              - 224.0.0.0/4       # multicast
+              - 240.0.0.0/4       # reserved + broadcast
         - ipBlock:
             cidr: ::/0
             except:
-              - fc00::/7
-              - fe80::/10
-              - ::1/128
+              - fc00::/7          # ULA
+              - fe80::/10         # link-local
+              - fec0::/10         # site-local (deprecated)
+              - ::/96             # IPv4-compatible (deprecated) incl. ::1
+              - 64:ff9b::/96      # NAT64: would reach IPv4 destinations above
+              - 64:ff9b:1::/48    # local-use NAT64
+              - 2002::/16         # 6to4: embeds an IPv4 destination
+              - 2001::/32         # Teredo
       ports:
         - {protocol: TCP, port: 443}
         - {protocol: TCP, port: 80}

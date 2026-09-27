@@ -92,6 +92,8 @@ pub struct CollectOptions {
     /// configuration placed by the bootstrap, setup output). They keep their base content in
     /// the artifact's view whatever happens to them in the working tree.
     pub exclude_paths: Vec<String>,
+    /// Accept gitlinks (mode 160000, nested repositories) and `.gitmodules` changes.
+    pub allow_submodules: bool,
 }
 
 impl Default for CollectOptions {
@@ -101,6 +103,7 @@ impl Default for CollectOptions {
             allowed_paths: vec![],
             reject_symlink_escape: true,
             exclude_paths: vec![],
+            allow_submodules: false,
         }
     }
 }
@@ -143,8 +146,6 @@ pub fn git(dir: &Path) -> Command {
             "gc.auto=0",
             "-c",
             "maintenance.auto=false",
-            "-c",
-            "uploadpack.allowAnySHA1InWant=true",
             "-c",
             "safe.directory=*",
         ])
@@ -321,7 +322,8 @@ pub async fn collect_patch(ws: &GitWorkspace, opts: &CollectOptions) -> Result<P
     if !meta.is_dir() {
         return Err(WorkspaceError::Policy("the workspace is no longer a directory".into()));
     }
-    let index = ws.scratch.join(format!("collect-{}.index", std::process::id()));
+    // Unique per call: a snapshot and the final collection may run concurrently.
+    let index = ws.scratch.join(format!("collect-{}.index", uuid_like()));
     let _ = tokio::fs::remove_file(&index).await;
     // Start from the private checkout index so sparse-checkout skip-worktree bits are
     // respected (the agent's `.git/index` is never read).
@@ -366,7 +368,9 @@ pub async fn collect_patch(ws: &GitWorkspace, opts: &CollectOptions) -> Result<P
             .await?;
     let binary_paths = parse_numstat_binary(&numstat);
     let staged = run(with_index(&["ls-files", "-s", "-z"]), "ls-files -s").await?;
-    let symlinks = parse_symlinks(&staged);
+    let modes = parse_modes(&staged);
+    let symlinks: Vec<(String, String)> =
+        modes.iter().filter(|(_, (m, _))| m == "120000").map(|(p, (_, sha))| (p.clone(), sha.clone())).collect();
 
     let mut changed = vec![];
     let fields: Vec<&[u8]> = name_status.split(|b| *b == 0).filter(|f| !f.is_empty()).collect();
@@ -376,11 +380,13 @@ pub async fn collect_patch(ws: &GitWorkspace, opts: &CollectOptions) -> Result<P
         let path = String::from_utf8_lossy(fields[i + 1]).to_string();
         i += 2;
         let symlink_blob = symlinks.iter().find(|(p, _)| p == &path).map(|(_, b)| b.clone());
+        let mode = (status != "D").then(|| modes.get(&path).map(|(m, _)| m.clone())).flatten();
         changed.push(ChangedPath {
             is_binary: binary_paths.contains(&path),
             is_symlink: symlink_blob.is_some() && status != "D",
             path,
             status,
+            mode,
         });
         if let Some(blob) = symlink_blob
             && opts.reject_symlink_escape
@@ -398,9 +404,19 @@ pub async fn collect_patch(ws: &GitWorkspace, opts: &CollectOptions) -> Result<P
         }
     }
     for c in &changed {
-        if c.path.split('/').any(|seg| seg == ".git" || seg == "..") {
+        // Case-insensitive: the patch must also be safe for consumers on case-insensitive
+        // filesystems (macOS, Windows), where `.GIT` is the repository directory.
+        if c.path.split('/').any(|seg| seg.eq_ignore_ascii_case(".git") || seg == "..") {
             let _ = tokio::fs::remove_file(&index).await;
             return Err(WorkspaceError::Policy(format!("path {:?} is not allowed", c.path)));
+        }
+        if !opts.allow_submodules && (c.mode.as_deref() == Some("160000") || c.path.eq_ignore_ascii_case(".gitmodules"))
+        {
+            let _ = tokio::fs::remove_file(&index).await;
+            return Err(WorkspaceError::Policy(format!(
+                "path {:?} is a submodule entry (gitlink or .gitmodules); set output.allowSubmodules to accept it",
+                c.path
+            )));
         }
         if !path_allowed(&c.path, &opts.allowed_paths) {
             let _ = tokio::fs::remove_file(&index).await;
@@ -435,7 +451,7 @@ pub async fn fingerprint(
     ws: &GitWorkspace,
     exclude_paths: &[String],
 ) -> Result<std::collections::BTreeMap<String, String>, WorkspaceError> {
-    let index = ws.scratch.join(format!("fingerprint-{}.index", std::process::id()));
+    let index = ws.scratch.join(format!("fingerprint-{}.index", uuid_like()));
     let _ = tokio::fs::remove_file(&index).await;
     let with_index = |args: &[&str]| {
         let mut c = ws.authoritative_git();
@@ -514,7 +530,8 @@ fn parse_numstat_binary(numstat: &[u8]) -> Vec<String> {
         .collect()
 }
 
-fn parse_symlinks(ls_files: &[u8]) -> Vec<(String, String)> {
+/// path -> (mode, blob sha) from `git ls-files -s -z`.
+fn parse_modes(ls_files: &[u8]) -> std::collections::HashMap<String, (String, String)> {
     // -z format: "mode sha stage\tpath\0"
     ls_files
         .split(|b| *b == 0)
@@ -523,9 +540,17 @@ fn parse_symlinks(ls_files: &[u8]) -> Vec<(String, String)> {
             let (meta, path) = s.split_once('\t')?;
             let mut m = meta.split_whitespace();
             let (mode, sha) = (m.next()?, m.next()?);
-            (mode == "120000").then(|| (path.to_string(), sha.to_string()))
+            Some((path.to_string(), (mode.to_string(), sha.to_string())))
         })
         .collect()
+}
+
+/// A random file-name component (no uuid dependency in this crate).
+fn uuid_like() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    format!("{}-{nanos:x}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed))
 }
 
 /// Check that `patch` applies cleanly to `base` of `url` (fresh clone into `dir`).
@@ -762,6 +787,43 @@ mod tests {
         let paths: Vec<_> = p.changed_paths.iter().map(|c| c.path.as_str()).collect();
         assert_eq!(paths, vec!["add.sh"]);
         assert!(std::fs::read_dir(&elsewhere).unwrap().next().is_none(), "runnerd touched the agent-chosen gitdir");
+    }
+
+    #[tokio::test]
+    async fn submodule_entries_are_rejected_unless_allowed() {
+        let (tmp, url, sha) = setup().await;
+        let repo = RepositoryInput { url, revision: sha, sparse_paths: vec![], depth: None };
+        let ws = prepare(&tmp.path().join("ws"), &tmp.path().join("scratch"), &repo).await.unwrap();
+        // A nested repository with a commit becomes a gitlink (mode 160000) on `git add -A`.
+        let nested = ws.dir.join("vendor/evil");
+        std::fs::create_dir_all(&nested).unwrap();
+        fixture::create(&nested).await.unwrap();
+        let err = collect_patch(&ws, &opts()).await.unwrap_err();
+        assert!(matches!(err, WorkspaceError::Policy(ref m) if m.contains("submodule")), "{err}");
+        let p = collect_patch(&ws, &CollectOptions { allow_submodules: true, ..opts() }).await.unwrap();
+        let gl = p.changed_paths.iter().find(|c| c.path == "vendor/evil").expect("gitlink entry");
+        assert_eq!(gl.mode.as_deref(), Some("160000"));
+        // .gitmodules alone is refused as well
+        std::fs::remove_dir_all(ws.dir.join("vendor")).unwrap();
+        std::fs::write(ws.dir.join(".gitmodules"), "[submodule \"x\"]\n\tpath = x\n\turl = https://evil.example/x\n")
+            .unwrap();
+        assert!(matches!(collect_patch(&ws, &opts()).await, Err(WorkspaceError::Policy(_))));
+    }
+
+    #[tokio::test]
+    async fn modes_are_reported_and_concurrent_collections_do_not_collide() {
+        let (tmp, url, sha) = setup().await;
+        let repo = RepositoryInput { url, revision: sha, sparse_paths: vec![], depth: None };
+        let ws = prepare(&tmp.path().join("ws"), &tmp.path().join("scratch"), &repo).await.unwrap();
+        tokio::fs::write(ws.dir.join("add.sh"), fixture::ADD_SH_FIXED).await.unwrap();
+        std::fs::write(ws.dir.join("run.sh"), "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(ws.dir.join("run.sh"), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let o = opts();
+        let (a, b) = tokio::join!(collect_patch(&ws, &o), collect_patch(&ws, &o));
+        let (a, b) = (a.unwrap(), b.unwrap());
+        assert_eq!(a.patch, b.patch);
+        let run = a.changed_paths.iter().find(|c| c.path == "run.sh").unwrap();
+        assert_eq!(run.mode.as_deref(), Some("100755"));
     }
 
     #[tokio::test]
