@@ -470,6 +470,14 @@ impl EnvironmentProvider {
     /// lease + materialize credentials → validate workdir → untrusted `bootstrap.exec` →
     /// launch harness → Ready → authenticated raw ACP.
     pub async fn create(&self, spec: EnvironmentSpec) -> Result<EnvironmentView> {
+        self.create_in(None, spec).await
+    }
+
+    /// [`create`](Self::create) for an owner object (the `AgentEnvironment` resource): its
+    /// namespace places the sandbox, is checked against credential profile policies and is
+    /// recorded on the run; its uid makes creation idempotent. `None` = provider-internal
+    /// namespace `environments` (library use, tests).
+    pub async fn create_in(&self, owner: Option<RunKey>, spec: EnvironmentSpec) -> Result<EnvironmentView> {
         spec.validate().map_err(|e| ProviderError::InvalidSpec(e.to_string()))?;
         if self.cfg.require_egress_proxy_for_credentials
             && spec.uses_credentials()
@@ -510,9 +518,12 @@ impl EnvironmentProvider {
             .journal
             .ensure_run(&NewRun {
                 id: Uuid::now_v7(),
-                k8s_namespace: "environments".into(),
-                k8s_name: format!("env-{}", &env_id.simple().to_string()[..12]),
-                k8s_uid: env_id.to_string(),
+                k8s_namespace: owner.as_ref().map(|o| o.namespace.clone()).unwrap_or_else(|| "environments".into()),
+                k8s_name: owner
+                    .as_ref()
+                    .map(|o| o.name.clone())
+                    .unwrap_or_else(|| format!("env-{}", &env_id.simple().to_string()[..12])),
+                k8s_uid: owner.as_ref().map(|o| o.uid.clone()).unwrap_or_else(|| env_id.to_string()),
                 task_id: spec.external_ref.clone(),
                 spec: serde_json::to_value(&stored)?,
             })
@@ -575,6 +586,8 @@ impl EnvironmentProvider {
             candidates: spec.credentials.profile.clone().into_iter().collect(),
             holder: format!("{}/env/{env_id}", self.cfg.controller_id),
             ttl: self.cfg.credential_lease_window,
+            namespace: owner.as_ref().map(|o| o.namespace.clone()).unwrap_or_else(|| "environments".into()),
+            class_name: format!("harness:{}", spec.harness.name),
         });
         let new_attempt = NewAttempt {
             id: attempt_id,
@@ -645,7 +658,11 @@ impl EnvironmentProvider {
             }
         }
         let req = SandboxRequest {
-            run_key: RunKey { namespace: "environments".into(), name: run.k8s_name.clone(), uid: env_id.to_string() },
+            run_key: RunKey {
+                namespace: run.k8s_namespace.clone(),
+                name: run.k8s_name.clone(),
+                uid: run.k8s_uid.clone(),
+            },
             run_id: run.id,
             attempt_id,
             ordinal: 1,
@@ -696,7 +713,14 @@ impl EnvironmentProvider {
         spec.repository = None;
         spec.workspace.source = None; // resolved from the artifact's origin and pinned to its base
         spec.workspace.overlays = vec![WorkspaceOverlay::PatchArtifact { artifact_id }];
-        self.create(spec).await
+        // A branch lives in its origin's namespace (and is checked against the same policies).
+        let origin = self.journal.get_run(meta.run_id).await?;
+        let owner = (origin.k8s_namespace != "environments").then(|| RunKey {
+            namespace: origin.k8s_namespace.clone(),
+            name: format!("{}-{short}", origin.k8s_name),
+            uid: Uuid::now_v7().to_string(),
+        });
+        self.create_in(owner, spec).await
     }
 
     /// Release what an ended environment holds: sandbox and credential lease (after the

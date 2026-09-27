@@ -33,7 +33,14 @@ fn new_attempt(run: Uuid, ordinal: i32) -> NewAttempt {
 }
 
 fn lease_req(ttl: Duration) -> LeaseRequest {
-    LeaseRequest { provider: "codex".into(), candidates: vec!["p1".into()], holder: "controller-a".into(), ttl }
+    LeaseRequest {
+        provider: "codex".into(),
+        candidates: vec!["p1".into()],
+        holder: "controller-a".into(),
+        ttl,
+        namespace: "team-a".into(),
+        class_name: "codex".into(),
+    }
 }
 
 async fn profile(j: &Journal, name: &str, max: i32) {
@@ -44,6 +51,8 @@ async fn profile(j: &Journal, name: &str, max: i32) {
         max_concurrent_leases: max,
         metadata: json!({}),
         material_fingerprint: "fp1".into(),
+        allowed_namespaces: vec!["team-a".into()],
+        allowed_classes: vec![],
     })
     .await
     .unwrap();
@@ -150,6 +159,8 @@ async fn credential_leases_are_exclusive_expire_and_respect_status() {
         max_concurrent_leases: 1,
         metadata: json!({}),
         material_fingerprint: "fp2".into(),
+        allowed_namespaces: vec!["team-a".into()],
+        allowed_classes: vec![],
     })
     .await
     .unwrap();
@@ -254,4 +265,59 @@ fn tempfile_dir() -> std::path::PathBuf {
     let d = std::env::temp_dir().join(format!("acp-blob-{}", Uuid::new_v4().simple()));
     std::fs::create_dir_all(&d).unwrap();
     d
+}
+
+/// Review finding 2: a profile is leased only to the namespaces (and classes) it allows.
+#[tokio::test]
+async fn profile_policy_restricts_who_may_lease() {
+    let Some(db) = temp_database().await else { return };
+    let j = &db.journal;
+    j.upsert_profile(&ProfileUpsert {
+        name: "p1".into(),
+        provider: "codex".into(),
+        store: "test".into(),
+        max_concurrent_leases: 5,
+        metadata: json!({}),
+        material_fingerprint: "fp1".into(),
+        allowed_namespaces: vec!["team-a".into()],
+        allowed_classes: vec!["codex".into()],
+    })
+    .await
+    .unwrap();
+    let (run, _) = j.ensure_run(&new_run()).await.unwrap();
+    let run = run.id;
+    let try_as = |ns: &str, class: &str| {
+        let mut r = lease_req(Duration::from_secs(60));
+        r.namespace = ns.into();
+        r.class_name = class.into();
+        r
+    };
+    for (i, (ns, class, ok)) in
+        [("team-b", "codex", false), ("team-a", "other", false), ("team-a", "codex", true)].into_iter().enumerate()
+    {
+        let res = j.start_attempt(&new_attempt(run, i as i32 + 1), Some(&try_as(ns, class))).await.unwrap();
+        assert_eq!(matches!(res, StartAttempt::Started { .. }), ok, "{ns}/{class}: {res:?}");
+        if !ok {
+            assert!(
+                matches!(res, StartAttempt::CredentialUnusable { ref detail } if detail.contains("not allowed")),
+                "{res:?}"
+            );
+        }
+    }
+    // default deny: no namespaces granted at all
+    j.upsert_profile(&ProfileUpsert {
+        name: "p1".into(),
+        provider: "codex".into(),
+        store: "test".into(),
+        max_concurrent_leases: 5,
+        metadata: json!({}),
+        material_fingerprint: "fp1".into(),
+        allowed_namespaces: vec![],
+        allowed_classes: vec![],
+    })
+    .await
+    .unwrap();
+    let res = j.start_attempt(&new_attempt(run, 9), Some(&try_as("team-a", "codex"))).await.unwrap();
+    assert!(matches!(res, StartAttempt::CredentialUnusable { ref detail } if detail.contains("auth allow")), "{res:?}");
+    db.drop_db().await;
 }

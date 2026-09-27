@@ -477,15 +477,49 @@ impl RunSpec {
             .map(|c| c.name.clone())
             .collect()
     }
+
+    /// Where a run may place credentials is an administrator decision: when the controller
+    /// has an image allowlist, every class that uses credentials must run a digest-pinned
+    /// image from it; when it has a service-account allowlist, every explicitly named
+    /// service account must be in it (unset = the controller's own default account).
+    pub fn placement_violations(&self, allowed_images: &[String], allowed_service_accounts: &[String]) -> Vec<String> {
+        let mut out = Vec::new();
+        for c in &self.runner_classes {
+            if !allowed_images.is_empty() && c.uses_credentials() && !image_allowed(&c.image, allowed_images) {
+                out.push(format!(
+                    "runner class {}: image {:?} is not a digest-pinned image from the controller's allowlist",
+                    c.name, c.image
+                ));
+            }
+            if let Some(sa) = &c.service_account_name
+                && !allowed_service_accounts.is_empty()
+                && !allowed_service_accounts.iter().any(|a| a == sa)
+            {
+                out.push(format!("runner class {}: service account {sa:?} is not allowed", c.name));
+            }
+        }
+        out
+    }
 }
 
-/// Conservative git revision check: a SHA or a ref name, never something git could parse
-/// as an option.
+/// `image` must be pinned (`repo@sha256:<64 hex>`) and either equal an allowlist entry or
+/// have its repository (the part before `@`) listed.
+pub fn image_allowed(image: &str, allowed: &[String]) -> bool {
+    let Some((repo, digest)) = image.split_once('@') else { return false };
+    let Some(hex) = digest.strip_prefix("sha256:") else { return false };
+    if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()) {
+        return false;
+    }
+    allowed.iter().any(|a| a == image || a == repo)
+}
+
 /// `file://` repository URL (fixtures inside the runner image; opt-in at the controller).
 pub fn is_file_url(url: &str) -> bool {
     url.trim().get(..7).is_some_and(|p| p.eq_ignore_ascii_case("file://"))
 }
 
+/// Conservative git revision check: a SHA or a ref name, never something git could parse
+/// as an option.
 pub fn is_safe_revision(rev: &str) -> bool {
     !rev.is_empty()
         && rev.len() <= 255

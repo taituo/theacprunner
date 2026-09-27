@@ -276,7 +276,7 @@ the engine never switches profile because of rate limiting.
 
 ```bash
 # Codex — ChatGPT login via device code (enable "device code login" in ChatGPT security settings)
-acp-runnerctl auth enroll codex personal-1                      # --runtime local (CLI on this machine)
+acp-runnerctl auth enroll codex personal-1 --allow-namespace team-a   # --runtime local (CLI on this machine)
 acp-runnerctl auth enroll codex personal-1 --runtime docker     # inside the pinned runner image
 acp-runnerctl auth enroll codex personal-1 --runtime kubectl    # temporary pod in acp-runner-system
 acp-runnerctl auth enroll codex personal-1 --method browser     # localhost:1455 callback flow
@@ -291,7 +291,27 @@ acp-runnerctl auth list                           # NAME PROVIDER AUTH PLAN FING
 acp-runnerctl auth inspect personal-1             # derived facts only (auth mode, plan, masked email,
                                                   # expiry, fingerprints); never token values
 acp-runnerctl auth disable|enable personal-1      # journal status (needs DATABASE_URL)
+acp-runnerctl auth allow personal-1 --allow-namespace team-a --allow-class codex   # usage policy
+acp-runnerctl auth allow personal-1 --clear       # nobody may lease it
 ```
+
+**Trust model (who may use a credential).** An `ACPRunnerClass` is namespaced, so anyone who
+can create classes and runs in a namespace could otherwise point a run at any enrolled
+profile. The administrator therefore decides three things, all default-deny or opt-in:
+
+* **Profile policy** (`--allow-namespace`, repeatable, `*` = all; `--allow-class`, empty =
+  any class; environments lease as class `harness:<name>`). Stored as Secret annotations
+  `acp-runner.dev/allowed-namespaces|allowed-classes` (or in `profile.json` for the file
+  store), mirrored into the journal and checked when the lease is taken. A profile enrolled
+  without `--allow-namespace` cannot be leased until `auth allow` grants it.
+* **Image allowlist** `ACP_RUNNER_ALLOWED_IMAGES` (comma-separated repositories or exact
+  references): when set, every class that uses credentials must run a `repo@sha256:<digest>`
+  image from it. Otherwise the run fails with `Unsupported` before any attempt.
+* **Service-account allowlist** `ACP_RUNNER_ALLOWED_SERVICE_ACCOUNTS`: when set, a class may
+  only name listed accounts (unset = the controller's hardened default account).
+
+A cluster-scoped `ACPClusterRunnerClass` would be the stronger long-term model; it is not
+implemented.
 
 Enrollment isolates the CLI in a temporary `HOME`/`CODEX_HOME`/`CLAUDE_CONFIG_DIR`,
 verifies the result with `codex login status` / `claude auth status --json` (no model

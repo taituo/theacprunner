@@ -81,6 +81,11 @@ pub struct EngineConfig {
     /// Accept `file://` repository URLs. They make runnerd (trusted container) read a
     /// repository from its own filesystem; meant for fixtures baked into the runner image.
     pub allow_file_repositories: bool,
+    /// Digest-pinned images (or image repositories) credentialed runner classes may use.
+    /// Empty = no restriction (development).
+    pub allowed_images: Vec<String>,
+    /// Service accounts runner classes may name. Empty = no restriction.
+    pub allowed_service_accounts: Vec<String>,
 }
 
 impl Default for EngineConfig {
@@ -95,6 +100,8 @@ impl Default for EngineConfig {
             credential_lease_margin: Duration::from_secs(300),
             require_egress_proxy_for_credentials: true,
             allow_file_repositories: false,
+            allowed_images: Vec::new(),
+            allowed_service_accounts: Vec::new(),
         }
     }
 }
@@ -268,6 +275,12 @@ impl Engine {
                  proxy; set egress.mode: proxy with an allowlisting egress proxy (development only: \
                  ACP_RUNNER_ALLOW_DIRECT_CREDENTIAL_EGRESS=true)"
             );
+            self.fail_run(&run, FailureReason::Unsupported { detail }).await?;
+            return Ok(Duration::ZERO);
+        }
+        let placement = spec.placement_violations(&self.cfg.allowed_images, &self.cfg.allowed_service_accounts);
+        if !placement.is_empty() {
+            let detail = placement.join("; ");
             self.fail_run(&run, FailureReason::Unsupported { detail }).await?;
             return Ok(Duration::ZERO);
         }
@@ -664,6 +677,8 @@ impl Engine {
             holder: self.cfg.controller_id.clone(),
             ttl: Duration::from_secs(t.hard_seconds + t.startup_seconds + 3 * t.grace_seconds)
                 + self.cfg.credential_lease_margin,
+            namespace: run.k8s_namespace.clone(),
+            class_name: class.name.clone(),
         });
         // Layout depends on the profile that will be leased; the store decides at lease time.
         // All candidates share the provider layout, so we fill the profile in afterwards.

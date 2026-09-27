@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Opt-in LIVE smoke test on the cluster (uses a real subscription login; small prompt).
-#   scripts/live-smoke.sh codex     # requires: acp-runnerctl auth enroll codex personal-1
-#   scripts/live-smoke.sh claude    # requires: acp-runnerctl auth enroll claude max-1
+#   scripts/live-smoke.sh codex     # requires: acp-runnerctl auth enroll codex personal-1 --allow-namespace acp-agents
+#   scripts/live-smoke.sh claude    # requires: acp-runnerctl auth enroll claude max-1 --allow-namespace acp-agents
 # Success = run Succeeded, patch parses, only add.sh changed, patch applies to the base
 # revision and `sh test.sh` prints PASS. No assertion on natural-language output.
 set -euo pipefail

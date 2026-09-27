@@ -574,6 +574,7 @@ async fn controller_end_to_end_on_a_real_apiserver() {
                 max_concurrent_leases: 1,
                 metadata: md,
                 store_ref: String::new(),
+                policy: acp_runner_engine::creds::ProfilePolicy::any(),
             },
             &bundle,
         )

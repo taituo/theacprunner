@@ -15,7 +15,7 @@
 //! encryption at rest configured — see README "Credential storage".
 
 use acp_runner_core::credentials::{CredentialBundle, CredentialMetadata, Provider};
-use acp_runner_engine::creds::{CredStoreError, CredentialStore, StoredProfile, check_profile_name};
+use acp_runner_engine::creds::{CredStoreError, CredentialStore, ProfilePolicy, StoredProfile, check_profile_name};
 use async_trait::async_trait;
 use k8s_openapi::ByteString;
 use k8s_openapi::api::core::v1::Secret;
@@ -28,6 +28,14 @@ pub const PROFILE_LABEL: &str = "acp-runner.dev/credential-profile";
 pub const PROVIDER_LABEL: &str = "acp-runner.dev/provider";
 pub const METADATA_ANNOTATION: &str = "acp-runner.dev/metadata";
 pub const MAX_LEASES_ANNOTATION: &str = "acp-runner.dev/max-concurrent-leases";
+/// Comma-separated namespaces whose runs may lease the profile (`*` = any). Absent = nobody.
+pub const ALLOWED_NAMESPACES_ANNOTATION: &str = "acp-runner.dev/allowed-namespaces";
+/// Comma-separated runner classes that may lease the profile. Absent = any class.
+pub const ALLOWED_CLASSES_ANNOTATION: &str = "acp-runner.dev/allowed-classes";
+
+fn split_list(v: Option<&String>) -> Vec<String> {
+    v.map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()).unwrap_or_default()
+}
 
 pub fn secret_name(profile: &str) -> String {
     format!("acp-cred-{profile}")
@@ -51,12 +59,17 @@ impl K8sSecretStore {
         let metadata: CredentialMetadata =
             ann.get(METADATA_ANNOTATION).and_then(|m| serde_json::from_str(m).ok()).unwrap_or_default();
         let max = ann.get(MAX_LEASES_ANNOTATION).and_then(|m| m.parse().ok()).unwrap_or(1);
+        let policy = ProfilePolicy {
+            allowed_namespaces: split_list(ann.get(ALLOWED_NAMESPACES_ANNOTATION)),
+            allowed_classes: split_list(ann.get(ALLOWED_CLASSES_ANNOTATION)),
+        };
         Some(StoredProfile {
             store_ref: format!("k8s-secret:{}/{}", self.namespace, s.metadata.name.clone().unwrap_or_default()),
             name,
             provider,
             max_concurrent_leases: max,
             metadata,
+            policy,
         })
     }
 
@@ -71,10 +84,19 @@ impl K8sSecretStore {
                     (PROVIDER_LABEL.to_string(), p.provider.as_str().to_string()),
                     ("app.kubernetes.io/managed-by".to_string(), "acp-runner".to_string()),
                 ])),
-                annotations: Some(BTreeMap::from([
-                    (METADATA_ANNOTATION.to_string(), serde_json::to_string(&p.metadata).unwrap_or_default()),
-                    (MAX_LEASES_ANNOTATION.to_string(), p.max_concurrent_leases.to_string()),
-                ])),
+                annotations: Some({
+                    let mut a = BTreeMap::from([
+                        (METADATA_ANNOTATION.to_string(), serde_json::to_string(&p.metadata).unwrap_or_default()),
+                        (MAX_LEASES_ANNOTATION.to_string(), p.max_concurrent_leases.to_string()),
+                    ]);
+                    if !p.policy.allowed_namespaces.is_empty() {
+                        a.insert(ALLOWED_NAMESPACES_ANNOTATION.to_string(), p.policy.allowed_namespaces.join(","));
+                    }
+                    if !p.policy.allowed_classes.is_empty() {
+                        a.insert(ALLOWED_CLASSES_ANNOTATION.to_string(), p.policy.allowed_classes.join(","));
+                    }
+                    a
+                }),
                 ..Default::default()
             },
             type_: Some("Opaque".into()),
@@ -167,6 +189,25 @@ impl CredentialStore for K8sSecretStore {
         match self.api().delete(&secret_name(profile), &DeleteParams::default()).await {
             Ok(_) => Ok(()),
             Err(kube::Error::Api(st)) if st.is_not_found() => Ok(()),
+            Err(e) => Err(store_err(e)),
+        }
+    }
+
+    async fn set_policy(&self, profile: &str, policy: &ProfilePolicy) -> Result<(), CredStoreError> {
+        let api = self.api();
+        let s = api
+            .get_opt(&secret_name(profile))
+            .await
+            .map_err(store_err)?
+            .ok_or_else(|| CredStoreError::NotFound(profile.to_string()))?;
+        let mut p =
+            self.to_profile(&s).ok_or_else(|| CredStoreError::Invalid("secret lacks acp-runner labels".into()))?;
+        let bundle: CredentialBundle = s.data.clone().unwrap_or_default().into_iter().map(|(k, v)| (k, v.0)).collect();
+        p.policy = policy.clone();
+        let updated = self.build(&p, &bundle, s.metadata.resource_version.clone());
+        match api.replace(&secret_name(profile), &PostParams::default(), &updated).await {
+            Ok(_) => Ok(()),
+            Err(kube::Error::Api(st)) if st.is_conflict() => Err(CredStoreError::Conflict(profile.to_string())),
             Err(e) => Err(store_err(e)),
         }
     }

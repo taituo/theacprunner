@@ -106,6 +106,18 @@ pub enum AuthCmd {
         #[arg(long, env = "DATABASE_URL")]
         database_url: String,
     },
+    /// Set who may lease a profile (replaces the previous policy; the controller picks it
+    /// up on its next profile sync, or immediately with --database-url).
+    Allow {
+        profile: String,
+        #[command(flatten)]
+        store: StoreArgs,
+        #[command(flatten)]
+        policy: auth::PolicyArgs,
+        /// Deny everybody.
+        #[arg(long)]
+        clear: bool,
+    },
     /// Delete a profile's stored material.
     Delete {
         profile: String,

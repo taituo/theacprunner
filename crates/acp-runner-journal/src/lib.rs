@@ -149,6 +149,28 @@ pub struct ProfileRow {
     pub last_used_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Namespaces whose runs may lease this profile (`*` = any). Empty = nobody.
+    pub allowed_namespaces: Vec<String>,
+    /// Runner classes that may lease it (empty = any class in an allowed namespace).
+    pub allowed_classes: Vec<String>,
+}
+
+impl ProfileRow {
+    /// May a run in `namespace`, using runner class `class`, lease this profile?
+    pub fn permits(&self, namespace: &str, class: &str) -> std::result::Result<(), String> {
+        let hit = |list: &[String], v: &str| list.iter().any(|x| x == "*" || x == v);
+        if !hit(&self.allowed_namespaces, namespace) {
+            return Err(if self.allowed_namespaces.is_empty() {
+                "no namespace may use it yet (acp-runnerctl auth allow)".to_string()
+            } else {
+                format!("not allowed for namespace {namespace}")
+            });
+        }
+        if !self.allowed_classes.is_empty() && !hit(&self.allowed_classes, class) {
+            return Err(format!("not allowed for runner class {class}"));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -207,6 +229,10 @@ pub struct LeaseRequest {
     pub candidates: Vec<String>,
     pub holder: String,
     pub ttl: Duration,
+    /// Namespace of the run / environment asking (checked against the profile policy).
+    pub namespace: String,
+    /// Runner class (or harness) asking.
+    pub class_name: String,
 }
 
 #[derive(Debug)]
@@ -233,6 +259,8 @@ pub struct ProfileUpsert {
     pub max_concurrent_leases: i32,
     pub metadata: Value,
     pub material_fingerprint: String,
+    pub allowed_namespaces: Vec<String>,
+    pub allowed_classes: Vec<String>,
 }
 
 /// Held for the duration of one reconcile; released on commit or drop.
@@ -459,6 +487,10 @@ impl Journal {
                 }
                 if p.status != "active" {
                     unusable.push(format!("{cand}: status {}", p.status));
+                    continue;
+                }
+                if let Err(why) = p.permits(&req.namespace, &req.class_name) {
+                    unusable.push(format!("{cand}: {why}"));
                     continue;
                 }
                 let active: i64 = sqlx::query_scalar(
@@ -825,10 +857,12 @@ impl Journal {
     /// enrollment) re-activates a profile flagged `needs_reauth`.
     pub async fn upsert_profile(&self, p: &ProfileUpsert) -> Result<()> {
         sqlx::query(
-            "INSERT INTO credential_profiles (name, provider, store, max_concurrent_leases, metadata, material_fingerprint)
-             VALUES ($1, $2, $3, $4, $5, $6)
+            "INSERT INTO credential_profiles (name, provider, store, max_concurrent_leases, metadata, material_fingerprint,
+                                             allowed_namespaces, allowed_classes)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
              ON CONFLICT (name) DO UPDATE SET
                 provider = EXCLUDED.provider, store = EXCLUDED.store,
+                allowed_namespaces = EXCLUDED.allowed_namespaces, allowed_classes = EXCLUDED.allowed_classes,
                 max_concurrent_leases = EXCLUDED.max_concurrent_leases, metadata = EXCLUDED.metadata,
                 status = CASE WHEN credential_profiles.status = 'needs_reauth'
                                AND credential_profiles.material_fingerprint IS DISTINCT FROM EXCLUDED.material_fingerprint
@@ -846,6 +880,8 @@ impl Journal {
         .bind(p.max_concurrent_leases.max(1))
         .bind(&p.metadata)
         .bind(&p.material_fingerprint)
+        .bind(&p.allowed_namespaces)
+        .bind(&p.allowed_classes)
         .execute(&self.pool)
         .await?;
         Ok(())

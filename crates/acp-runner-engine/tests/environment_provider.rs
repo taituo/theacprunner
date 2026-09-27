@@ -477,6 +477,7 @@ async fn environment_holds_an_exclusive_credential_lease_for_its_lifetime() {
                 max_concurrent_leases: 3,
                 metadata: md,
                 store_ref: String::new(),
+                policy: acp_runner_engine::creds::ProfilePolicy::any(),
             },
             &bundle,
         )

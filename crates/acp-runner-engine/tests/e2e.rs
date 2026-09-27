@@ -473,6 +473,7 @@ async fn enroll_codex(h: &H, name: &str) {
                 max_concurrent_leases: 5,
                 metadata: md,
                 store_ref: String::new(),
+                policy: acp_runner_engine::creds::ProfilePolicy::any(),
             },
             &bundle,
         )
@@ -532,6 +533,7 @@ async fn enroll_claude(h: &H, name: &str) {
                 max_concurrent_leases: 2,
                 metadata: md,
                 store_ref: String::new(),
+                policy: acp_runner_engine::creds::ProfilePolicy::any(),
             },
             &bundle,
         )
@@ -875,4 +877,95 @@ mod reqwest_like {
             .unwrap()
         }
     }
+}
+
+/// Review finding 2 (trust boundary): a profile is only leased by the namespaces and classes
+/// its policy names; an enrolled profile with no policy is unusable.
+#[tokio::test]
+async fn credential_profile_policy_limits_who_may_lease() {
+    let Some(h) = H::new().await else { return };
+    enroll_codex(&h, "codex-1").await;
+    let codex_class = |h: &H| {
+        let mut c = h.class("codexish", "ok");
+        c.credentials = CredentialRequirement {
+            provider: Some("codex".into()),
+            profiles: vec!["codex-1".into()],
+            file_targets: BTreeMap::new(),
+        };
+        c
+    };
+    for (policy, want) in [
+        (acp_runner_engine::creds::ProfilePolicy::default(), "acp-runnerctl auth allow"),
+        (
+            acp_runner_engine::creds::ProfilePolicy {
+                allowed_namespaces: vec!["team-b".into()],
+                allowed_classes: vec![],
+            },
+            "not allowed for namespace default",
+        ),
+        (
+            acp_runner_engine::creds::ProfilePolicy {
+                allowed_namespaces: vec!["default".into()],
+                allowed_classes: vec!["other".into()],
+            },
+            "not allowed for runner class codexish",
+        ),
+    ] {
+        h.creds.set_policy("codex-1", &policy).await.unwrap();
+        sync_profiles(h.creds.as_ref(), &h.engine.journal).await.unwrap();
+        let v = h.drive(&h.input(vec![codex_class(&h)], 1), Duration::from_secs(30)).await;
+        assert_eq!(v.phase, RunPhase::Failed, "{policy:?}: {v:?}");
+        let evs = h.engine.journal.events_for_run(v.run_id, 0, 10_000).await.unwrap();
+        assert!(evs.iter().any(|e| e.data.to_string().contains(want)), "{policy:?}: expected {want:?}");
+    }
+    let ok = acp_runner_engine::creds::ProfilePolicy {
+        allowed_namespaces: vec!["default".into()],
+        allowed_classes: vec!["codexish".into()],
+    };
+    h.creds.set_policy("codex-1", &ok).await.unwrap();
+    sync_profiles(h.creds.as_ref(), &h.engine.journal).await.unwrap();
+    let v = h.drive(&h.input(vec![codex_class(&h)], 1), Duration::from_secs(30)).await;
+    assert_eq!(v.phase, RunPhase::Succeeded, "{v:?}");
+    h.done().await;
+}
+
+/// Credentialed classes must run an allowlisted, digest-pinned image; named service accounts
+/// must be allowlisted.
+#[tokio::test]
+async fn image_and_service_account_allowlists_are_enforced() {
+    let Some(h) = H::with(
+        |c| {
+            c.allowed_images = vec!["ghcr.io/acp/runner".into()];
+            c.allowed_service_accounts = vec!["acp-agent".into()];
+        },
+        8 * 1024 * 1024,
+    )
+    .await
+    else {
+        return;
+    };
+    enroll_codex(&h, "codex-1").await;
+    let mut c = h.class("codexish", "ok");
+    c.credentials = CredentialRequirement {
+        provider: Some("codex".into()),
+        profiles: vec!["codex-1".into()],
+        file_targets: BTreeMap::new(),
+    };
+    c.image = "ghcr.io/acp/runner:latest".into();
+    let v = h.drive(&h.input(vec![c.clone()], 1), Duration::from_secs(30)).await;
+    assert_eq!(v.phase, RunPhase::Failed, "{v:?}");
+    assert_eq!(v.attempt_count, 0);
+    assert!(v.failure.unwrap().message().contains("digest-pinned"));
+
+    let mut f = h.class("fake-default", "ok");
+    f.service_account_name = Some("cluster-admin".into());
+    let v = h.drive(&h.input(vec![f], 1), Duration::from_secs(30)).await;
+    assert_eq!(v.phase, RunPhase::Failed, "{v:?}");
+    assert!(v.failure.unwrap().message().contains("service account"));
+
+    let mut f = h.class("fake-default", "ok");
+    f.service_account_name = Some("acp-agent".into());
+    let v = h.drive(&h.input(vec![f], 1), Duration::from_secs(30)).await;
+    assert_eq!(v.phase, RunPhase::Succeeded, "uncredentialed classes need no pinned image: {v:?}");
+    h.done().await;
 }

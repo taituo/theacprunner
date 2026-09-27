@@ -126,6 +126,17 @@ pub struct RunArgs {
     /// Accept `file://` repository URLs (fixtures baked into the runner image).
     #[arg(long, env = "ACP_RUNNER_ALLOW_FILE_REPOS", default_value_t = false, action = clap::ArgAction::Set)]
     pub allow_file_repos: bool,
+    /// Comma-separated digest-pinned images or image repositories that runner classes
+    /// using credentials may run (`repo@sha256:...` required). Empty = unrestricted.
+    #[arg(long, env = "ACP_RUNNER_ALLOWED_IMAGES", value_delimiter = ',', default_value = "")]
+    pub allowed_images: Vec<String>,
+    /// Comma-separated service accounts runner classes may name. Empty = unrestricted.
+    #[arg(long, env = "ACP_RUNNER_ALLOWED_SERVICE_ACCOUNTS", value_delimiter = ',', default_value = "")]
+    pub allowed_service_accounts: Vec<String>,
+}
+
+fn nonempty(v: &[String]) -> Vec<String> {
+    v.iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
 }
 
 pub fn init_tracing() {
@@ -216,6 +227,8 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
             record_raw_payloads: args.common.record_raw,
             require_egress_proxy_for_credentials: !args.allow_direct_credential_egress,
             allow_file_repositories: args.allow_file_repos,
+            allowed_images: nonempty(&args.allowed_images),
+            allowed_service_accounts: nonempty(&args.allowed_service_accounts),
             ..Default::default()
         },
     });

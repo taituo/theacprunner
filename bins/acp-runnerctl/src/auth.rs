@@ -19,7 +19,9 @@ use acp_runner_core::credentials::{
     CredentialBundle, CredentialMetadata, Provider, validate_bundle, validate_claude_token,
 };
 use acp_runner_drivers::AuthState;
-use acp_runner_engine::creds::{CredentialStore, FileCredentialStore, StoredProfile, check_profile_name};
+use acp_runner_engine::creds::{
+    CredentialStore, FileCredentialStore, ProfilePolicy, StoredProfile, check_profile_name, sync_profiles,
+};
 use acp_runner_journal::Journal;
 use acp_runner_k8s::secret_store::K8sSecretStore;
 use anyhow::{Context, bail};
@@ -67,6 +69,48 @@ pub struct EnrollArgs {
     /// Skip the post-login status check.
     #[arg(long)]
     pub no_verify: bool,
+    #[command(flatten)]
+    pub policy: PolicyArgs,
+}
+
+/// Who may lease a profile. Default deny: a profile enrolled without `--allow-namespace`
+/// cannot be leased by any run until `runnerctl auth allow` grants it.
+#[derive(Args, Debug, Clone, Default)]
+pub struct PolicyArgs {
+    /// Namespace allowed to lease the profile (repeatable; `*` = every namespace).
+    #[arg(long = "allow-namespace")]
+    pub allow_namespace: Vec<String>,
+    /// Runner class allowed to lease the profile (repeatable; none = any class).
+    /// Environments use `harness:<name>`.
+    #[arg(long = "allow-class")]
+    pub allow_class: Vec<String>,
+}
+
+fn is_dns_label(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 63
+        && s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && !s.starts_with('-')
+        && !s.ends_with('-')
+}
+
+impl PolicyArgs {
+    pub fn policy(&self) -> anyhow::Result<ProfilePolicy> {
+        for n in &self.allow_namespace {
+            if n != "*" && !is_dns_label(n) {
+                bail!("--allow-namespace {n:?} is not a namespace name or `*`");
+            }
+        }
+        for c in &self.allow_class {
+            if c.is_empty() || c.contains(',') || c.chars().any(char::is_whitespace) {
+                bail!("--allow-class {c:?} is not a class name");
+            }
+        }
+        Ok(ProfilePolicy {
+            allowed_namespaces: self.allow_namespace.clone(),
+            allowed_classes: self.allow_class.clone(),
+        })
+    }
 }
 
 pub async fn open_store(s: &StoreArgs) -> anyhow::Result<Box<dyn CredentialStore>> {
@@ -89,6 +133,23 @@ pub async fn run(cmd: AuthCmd) -> anyhow::Result<()> {
         AuthCmd::Inspect { profile, store, output } => inspect(&profile, store, &output).await,
         AuthCmd::Disable { profile, database_url } => set_status(&profile, &database_url, "disabled").await,
         AuthCmd::Enable { profile, database_url } => set_status(&profile, &database_url, "active").await,
+        AuthCmd::Allow { profile, store, policy, clear } => {
+            let p = if clear { ProfilePolicy::default() } else { policy.policy()? };
+            if !clear && p.allowed_namespaces.is_empty() {
+                bail!("give at least one --allow-namespace (or --clear to deny everybody)");
+            }
+            let st = open_store(&store).await?;
+            st.set_policy(&profile, &p).await?;
+            if let Some(url) = &store.database_url {
+                sync_profiles(st.as_ref(), &Journal::connect(url, 2).await?).await?;
+            }
+            println!(
+                "profile {profile}: namespaces={:?} classes={}",
+                p.allowed_namespaces,
+                if p.allowed_classes.is_empty() { "any".to_string() } else { format!("{:?}", p.allowed_classes) }
+            );
+            Ok(())
+        }
         AuthCmd::Delete { profile, store } => {
             open_store(&store).await?.delete(&profile).await?;
             if let Some(url) = &store.database_url {
@@ -393,8 +454,15 @@ async fn enroll(a: EnrollArgs) -> anyhow::Result<()> {
         max_concurrent_leases: max,
         metadata: metadata.clone(),
         store_ref: String::new(),
+        policy: a.policy.policy()?,
     };
     store.save(&sp, &bundle).await?;
+    if sp.policy.allowed_namespaces.is_empty() {
+        println!(
+            "note: no --allow-namespace given; no run may lease {:?} until `runnerctl auth allow` grants it",
+            a.profile
+        );
+    }
     println!("enrolled credential profile {:?}", a.profile);
     print_metadata(&a.profile, provider, max, &metadata, "yaml")?;
     println!(

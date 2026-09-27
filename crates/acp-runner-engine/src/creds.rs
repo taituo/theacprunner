@@ -23,6 +23,27 @@ pub struct StoredProfile {
     pub max_concurrent_leases: i32,
     pub metadata: CredentialMetadata,
     pub store_ref: String,
+    /// Who may lease the profile (default: nobody).
+    pub policy: ProfilePolicy,
+}
+
+/// Usage policy of a credential profile: which namespaces (`*` = any) and runner classes
+/// (empty = any) may lease it. Stored next to the credential (Secret annotations / profile
+/// file) and mirrored into the journal. Default deny.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfilePolicy {
+    #[serde(default)]
+    pub allowed_namespaces: Vec<String>,
+    #[serde(default)]
+    pub allowed_classes: Vec<String>,
+}
+
+impl ProfilePolicy {
+    /// Everybody (tests and single-tenant development setups).
+    pub fn any() -> Self {
+        ProfilePolicy { allowed_namespaces: vec!["*".into()], allowed_classes: vec![] }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -52,6 +73,8 @@ pub trait CredentialStore: Send + Sync {
         metadata: &CredentialMetadata,
     ) -> Result<(), CredStoreError>;
     async fn delete(&self, profile: &str) -> Result<(), CredStoreError>;
+    /// Replace the usage policy of an existing profile (credential material untouched).
+    async fn set_policy(&self, profile: &str, policy: &ProfilePolicy) -> Result<(), CredStoreError>;
 }
 
 /// Mirror the store's profiles into `credential_profiles` (non-secret records only).
@@ -67,6 +90,8 @@ pub async fn sync_profiles(store: &dyn CredentialStore, journal: &Journal) -> an
                 max_concurrent_leases: max,
                 metadata: serde_json::to_value(&p.metadata)?,
                 material_fingerprint: p.metadata.material_fingerprint.clone(),
+                allowed_namespaces: p.policy.allowed_namespaces.clone(),
+                allowed_classes: p.policy.allowed_classes.clone(),
             })
             .await?;
     }
@@ -84,6 +109,8 @@ struct ProfileFile {
     provider: Provider,
     max_concurrent_leases: i32,
     metadata: CredentialMetadata,
+    #[serde(default)]
+    policy: ProfilePolicy,
 }
 
 fn valid_profile_name(name: &str) -> bool {
@@ -120,6 +147,7 @@ impl CredentialStore for FileCredentialStore {
                     provider: pf.provider,
                     max_concurrent_leases: pf.max_concurrent_leases,
                     metadata: pf.metadata,
+                    policy: pf.policy,
                 });
             }
         }
@@ -145,6 +173,7 @@ impl CredentialStore for FileCredentialStore {
             max_concurrent_leases: pf.max_concurrent_leases,
             metadata: pf.metadata,
             store_ref: format!("file:{}", dir.display()),
+            policy: pf.policy,
         };
         Ok((sp, bundle))
     }
@@ -165,6 +194,7 @@ impl CredentialStore for FileCredentialStore {
             provider: profile.provider,
             max_concurrent_leases: profile.max_concurrent_leases,
             metadata: profile.metadata.clone(),
+            policy: profile.policy.clone(),
         };
         std::fs::write(
             dir.join("profile.json"),
@@ -192,5 +222,11 @@ impl CredentialStore for FileCredentialStore {
     async fn delete(&self, profile: &str) -> Result<(), CredStoreError> {
         check_profile_name(profile)?;
         std::fs::remove_dir_all(self.root.join(profile)).map_err(|e| CredStoreError::Store(e.to_string()))
+    }
+
+    async fn set_policy(&self, profile: &str, policy: &ProfilePolicy) -> Result<(), CredStoreError> {
+        let (mut sp, bundle) = self.load(profile).await?;
+        sp.policy = policy.clone();
+        self.save(&sp, &bundle).await
     }
 }
