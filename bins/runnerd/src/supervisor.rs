@@ -226,7 +226,7 @@ impl<'a> Emitter<'a> {
             stage: self.stage.to_string(),
         };
         match self.sink.heartbeat(&hb).await {
-            Ok(d) => d,
+            Ok(r) => r.directive,
             Err(e) => {
                 tracing::warn!(error = %e, "heartbeat failed");
                 None

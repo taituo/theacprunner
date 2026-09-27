@@ -882,8 +882,8 @@ impl EnvironmentProvider {
         let env = self.journal.get_environment(env_id).await?.ok_or_else(|| anyhow::anyhow!("unknown environment"))?;
         anyhow::ensure!(!env.phase().is_terminal(), "environment is terminal");
         let snapshot_id = Uuid::now_v7();
-        self.ingest
-            .push_env_directive(env.attempt_id, RunnerDirective::Snapshot { snapshot_id: Some(snapshot_id), label });
+        let d = RunnerDirective::Snapshot { snapshot_id: Some(snapshot_id), label };
+        self.journal.enqueue_directive(env.attempt_id, &serde_json::to_value(&d)?).await?;
         Ok(snapshot_id)
     }
 
@@ -950,7 +950,7 @@ impl EnvironmentProvider {
     async fn terminate(&self, env_id: Uuid, directive: RunnerDirective, timeout: Duration) -> Result<EnvironmentView> {
         let env = self.journal.get_environment(env_id).await?.ok_or_else(|| anyhow::anyhow!("unknown environment"))?;
         if !env.phase().is_terminal() {
-            self.ingest.push_env_directive(env.attempt_id, directive);
+            self.journal.enqueue_directive(env.attempt_id, &serde_json::to_value(&directive)?).await?;
         }
         let deadline = Instant::now() + timeout;
         loop {

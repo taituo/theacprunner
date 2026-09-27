@@ -1,8 +1,13 @@
 //! kube-runtime controller: ACPRun -> engine.reconcile -> ACPRun.status.
 //!
-//! Multiple replicas are safe: each reconcile holds a PostgreSQL advisory lock on the run,
-//! attempts carry supervision leases, and all state lives in PostgreSQL. No leader election
-//! is required (a replica that dies simply stops renewing its leases).
+//! Multiple replicas: each reconcile holds a PostgreSQL advisory lock on the run, attempts
+//! carry supervision leases, and the ingest API keeps no authoritative state in memory
+//! (heartbeat journaling rate limit, environment directives and their acknowledgements are
+//! rows), so runnerd may reach any replica through the Service. What is per replica: the
+//! "attempt ended" notification (only speeds up the local replica; others see it on their
+//! next requeue), the JWKS cache and metrics. No leader election is required (a replica that
+//! dies simply stops renewing its leases). Covered by the journal/engine tests with two
+//! engines on one database; not load-tested with several controller pods.
 
 use acp_runner_engine::backend::RunKey;
 use acp_runner_engine::{Engine, RunInput, RunView};

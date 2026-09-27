@@ -413,6 +413,10 @@ pub enum RunnerDirective {
 pub struct HeartbeatReply {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub directive: Option<RunnerDirective>,
+    /// Durable directives carry an id: runnerd acknowledges it with a `directive_ack`
+    /// progress event (`detail.directiveId`) and ignores redeliveries it already handled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directive_id: Option<uuid::Uuid>,
 }
 
 /// Truncate a string to at most `max` bytes on a char boundary.

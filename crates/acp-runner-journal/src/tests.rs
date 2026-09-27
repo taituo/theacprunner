@@ -321,3 +321,40 @@ async fn profile_policy_restricts_who_may_lease() {
     assert!(matches!(res, StartAttempt::CredentialUnusable { ref detail } if detail.contains("auth allow")), "{res:?}");
     db.drop_db().await;
 }
+
+/// V5: directives are durable, delivered in order, redelivered until acknowledged, and only
+/// the owning attempt can acknowledge them. The heartbeat journaling rate limit is shared.
+#[tokio::test]
+async fn directives_are_ordered_redelivered_and_acked() {
+    let Some(db) = temp_database().await else { return };
+    let j = &db.journal;
+    let (run, _) = j.ensure_run(&new_run()).await.unwrap();
+    let StartAttempt::Started { attempt, .. } = j.start_attempt(&new_attempt(run.id, 1), None).await.unwrap() else {
+        panic!("attempt not started")
+    };
+    let StartAttempt::Started { attempt: other, .. } = j.start_attempt(&new_attempt(run.id, 2), None).await.unwrap()
+    else {
+        panic!("attempt not started")
+    };
+    let a = attempt.id;
+    assert!(j.next_directive(a, Duration::from_secs(10)).await.unwrap().is_none());
+    let d1 = j.enqueue_directive(a, &json!({"action": "snapshot"})).await.unwrap();
+    let d2 = j.enqueue_directive(a, &json!({"action": "finish"})).await.unwrap();
+    // first delivery of the head
+    let (id, v) = j.next_directive(a, Duration::from_secs(10)).await.unwrap().unwrap();
+    assert_eq!((id, v["action"].as_str()), (d1, Some("snapshot")));
+    // not redelivered before the interval, and d2 waits behind it
+    assert!(j.next_directive(a, Duration::from_secs(10)).await.unwrap().is_none());
+    // redelivered once the interval passed (0 s here)
+    assert_eq!(j.next_directive(a, Duration::ZERO).await.unwrap().unwrap().0, d1);
+    // another attempt cannot acknowledge it
+    assert!(!j.ack_directive(other.id, d1).await.unwrap());
+    assert!(j.ack_directive(a, d1).await.unwrap());
+    assert_eq!(j.next_directive(a, Duration::from_secs(10)).await.unwrap().unwrap().0, d2);
+    let all = j.directives_for_attempt(a).await.unwrap();
+    assert_eq!(all.iter().map(|d| (d.0, d.2, d.3)).collect::<Vec<_>>(), vec![(d1, 2, true), (d2, 1, false)]);
+
+    assert!(j.touch_heartbeat_rate_limited(a, Duration::from_secs(60)).await.unwrap());
+    assert!(!j.touch_heartbeat_rate_limited(a, Duration::from_secs(60)).await.unwrap());
+    assert!(j.touch_heartbeat_rate_limited(a, Duration::ZERO).await.unwrap());
+}

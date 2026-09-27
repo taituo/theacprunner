@@ -216,6 +216,12 @@ async fn provider_create_connect_turns_snapshot_finish() {
     let content = h.provider.artifacts.get_content(art_id).await.unwrap();
     let text = String::from_utf8_lossy(&content);
     assert!(text.contains("add.sh") && text.contains("extra.txt"), "final patch missing files");
+    // the directives were durable rows, each acknowledged by runnerd
+    let env = h.provider.journal.get_environment(view.id).await.unwrap().unwrap();
+    let ds = h.provider.journal.directives_for_attempt(env.attempt_id).await.unwrap();
+    let actions: Vec<&str> = ds.iter().map(|d| d.1["action"].as_str().unwrap()).collect();
+    assert_eq!(actions, vec!["snapshot", "snapshot", "finish"]);
+    assert!(ds.iter().take(2).all(|d| d.3), "snapshots not acknowledged: {ds:?}");
     h.done().await;
 }
 

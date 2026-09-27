@@ -507,6 +507,7 @@ pub async fn run_environment(
         idle_since: Instant::now(),
         tap: AcpTap::default(),
         agent_open: true,
+        handled_directives: std::collections::HashSet::new(),
     };
     let idle_timeout = idle_timeout_seconds.map(Duration::from_secs);
     let max_lifetime = max_lifetime_seconds.map(Duration::from_secs);
@@ -562,7 +563,16 @@ pub async fn run_environment(
                 let hb = HeartbeatData { agent_alive: state.agent_open, agent_pid: None, seconds_since_progress: None, stage: state.phase.as_str().to_string() };
                 // Provider operations (snapshot/finish/cancel) arrive on the heartbeat reply
                 // (controller -> runnerd); they never travel on the ACP dataplane.
-                if let Ok(Some(directive)) = em.sink.heartbeat(&hb).await {
+                let reply = em.sink.heartbeat(&hb).await.unwrap_or_default();
+                if let Some(directive) = reply.directive {
+                    // Durable directives are redelivered until acknowledged; handle each once.
+                    if let Some(id) = reply.directive_id {
+                        let fresh = state.handled_directives.insert(id);
+                        em.progress("directive_ack", "directive received", json!({"directiveId": id, "duplicate": !fresh})).await;
+                        if !fresh {
+                            continue;
+                        }
+                    }
                     match directive {
                         RunnerDirective::Finish => break Finish::Finish,
                         RunnerDirective::Cancel { reason } => break Finish::Cancel(reason.message()),
@@ -738,6 +748,7 @@ struct EnvState {
     idle_since: Instant,
     tap: AcpTap,
     agent_open: bool,
+    handled_directives: std::collections::HashSet<Uuid>,
 }
 
 async fn recv_caller(state: &mut EnvState) -> Option<String> {

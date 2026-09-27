@@ -41,9 +41,8 @@ use axum::{Json, Router};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
 use uuid::Uuid;
 
@@ -59,10 +58,8 @@ pub struct IngestState {
     /// Triggers an immediate reconcile of the run after terminal reports.
     pub notify: Option<UnboundedSender<RunKey>>,
     pub heartbeat_journal_every: Duration,
-    hb_last: Mutex<HashMap<Uuid, Instant>>,
     /// Environment provider operations pending delivery to runnerd on the next heartbeat,
     /// keyed by attempt id. Snapshot/Finish/Cancel travel controller -> runnerd this way.
-    env_directives: Mutex<HashMap<Uuid, std::collections::VecDeque<acp_runner_core::events::RunnerDirective>>>,
     /// Serves pinned harness artifacts to environment bootstraps.
     pub harnesses: Option<Arc<dyn crate::harness::HarnessProvider>>,
     /// Each heartbeat extends the attempt's credential lease to at least now + this window.
@@ -88,8 +85,6 @@ impl IngestState {
             metrics,
             notify,
             heartbeat_journal_every: Duration::from_secs(60),
-            hb_last: Mutex::new(HashMap::new()),
-            env_directives: Mutex::new(HashMap::new()),
             harnesses: None,
             lease_heartbeat_window: Duration::from_secs(15 * 60),
             redactor: Redactor::new(),
@@ -105,11 +100,6 @@ impl IngestState {
     pub fn with_harnesses(mut self, h: Arc<dyn crate::harness::HarnessProvider>) -> Self {
         self.harnesses = Some(h);
         self
-    }
-
-    /// Queue a provider operation for the environment backed by `attempt_id`.
-    pub fn push_env_directive(&self, attempt_id: Uuid, directive: acp_runner_core::events::RunnerDirective) {
-        self.env_directives.lock().expect("lock").entry(attempt_id).or_default().push_back(directive);
     }
 }
 
@@ -181,6 +171,9 @@ async fn authenticate(st: &IngestState, headers: &HeaderMap, allow_pending: bool
 /// How long after an attempt ended its runnerd may still hand a refreshed credential back
 /// (the controller may end an attempt — cancel, timeout — before runnerd's own shutdown path
 /// runs). The attempt must still hold its unreleased lease.
+/// An unacknowledged directive is sent again after this long.
+pub const DIRECTIVE_REDELIVERY: Duration = Duration::from_secs(10);
+
 pub const WRITEBACK_GRACE: Duration = Duration::from_secs(600);
 
 /// Like [`authenticate`], but also accepts a recently finished attempt (see [`WRITEBACK_GRACE`]).
@@ -371,6 +364,15 @@ async fn post_events(
     }) {
         st.journal.touch_progress(a.id, chrono::Utc::now()).await?;
     }
+    for id in batch.events.iter().filter_map(|e| {
+        (e.kind == EventKind::Progress
+            && e.source == EventSource::Runnerd
+            && e.data.get("category").and_then(|c| c.as_str()) == Some("directive_ack"))
+        .then(|| e.data.pointer("/detail/directiveId").and_then(|v| v.as_str()).and_then(|s| s.parse::<Uuid>().ok()))
+        .flatten()
+    }) {
+        st.journal.ack_directive(a.id, id).await?;
+    }
     if let Some(ev) = batch.events.iter().find(|e| e.kind == EventKind::AgentStarted) {
         st.journal
             .transition_attempt(
@@ -463,33 +465,32 @@ async fn post_heartbeat(
     Json(mut hb): Json<serde_json::Value>,
 ) -> ApiResult<Response> {
     let a = authenticate(&st, &headers, true).await?;
-    st.journal.touch_heartbeat(a.id).await?;
     // A live sandbox keeps its credential lease alive (environment leases span the whole
     // lifetime; a dead sandbox's lease lapses after the window).
     st.journal.extend_lease(a.id, st.lease_heartbeat_window).await?;
-    let journal_it = {
-        let mut m = st.hb_last.lock().expect("lock");
-        let due = m.get(&a.id).map(|t| t.elapsed() >= st.heartbeat_journal_every).unwrap_or(true);
-        if due {
-            m.insert(a.id, Instant::now());
-        }
-        due
-    };
-    if journal_it {
+    if st.journal.touch_heartbeat_rate_limited(a.id, st.heartbeat_journal_every).await? {
         st.redactor.redact_json(&mut hb);
         let ev = EventEnvelope::new(EventKind::Heartbeat, EventSource::Runnerd, hb);
         st.journal.append_event(a.run_id, Some(a.id), &ev).await?;
     }
     // Controller decisions travel back on the heartbeat (runnerd has no inbound port).
-    if let Some(d) = st.env_directives.lock().expect("lock").get_mut(&a.id).and_then(|q| q.pop_front()) {
-        return Ok(Json(HeartbeatReply { directive: Some(d) }).into_response());
+    // A cancel recorded on the attempt wins over anything queued.
+    if let Some(reason) = a.cancel_request() {
+        let reply = HeartbeatReply { directive: Some(RunnerDirective::Cancel { reason }), directive_id: None };
+        return Ok(Json(reply).into_response());
     }
-    match a.cancel_request() {
-        Some(reason) => {
-            Ok(Json(HeartbeatReply { directive: Some(RunnerDirective::Cancel { reason }) }).into_response())
+    if let Some((id, raw)) = st.journal.next_directive(a.id, DIRECTIVE_REDELIVERY).await? {
+        match serde_json::from_value::<RunnerDirective>(raw) {
+            Ok(d) => {
+                return Ok(Json(HeartbeatReply { directive: Some(d), directive_id: Some(id) }).into_response());
+            }
+            Err(e) => {
+                tracing::error!(directive_id = %id, error = %e, "undecodable directive dropped");
+                st.journal.ack_directive(a.id, id).await?;
+            }
         }
-        None => Ok(StatusCode::NO_CONTENT.into_response()),
     }
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 #[derive(Deserialize)]

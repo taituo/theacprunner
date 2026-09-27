@@ -692,6 +692,84 @@ impl Journal {
         Ok(())
     }
 
+    /// Record a heartbeat; returns true when it should also be written to the event journal
+    /// (at most once per `journal_every`, shared by every controller replica).
+    pub async fn touch_heartbeat_rate_limited(&self, id: Uuid, journal_every: Duration) -> Result<bool> {
+        let due: Option<bool> = sqlx::query_scalar(
+            "UPDATE attempts SET last_heartbeat_at = now(),
+                 last_heartbeat_journaled_at = CASE
+                     WHEN last_heartbeat_journaled_at IS NULL
+                          OR last_heartbeat_journaled_at <= now() - $2::interval THEN now()
+                     ELSE last_heartbeat_journaled_at END
+             WHERE id = $1
+             RETURNING last_heartbeat_journaled_at = now()",
+        )
+        .bind(id)
+        .bind(interval(journal_every))
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(due.unwrap_or(false))
+    }
+
+    /// Queue a directive for runnerd (delivered in order on heartbeat replies).
+    pub async fn enqueue_directive(&self, attempt_id: Uuid, directive: &Value) -> Result<Uuid> {
+        let id = Uuid::now_v7();
+        sqlx::query("INSERT INTO environment_directives (id, attempt_id, directive) VALUES ($1, $2, $3)")
+            .bind(id)
+            .bind(attempt_id)
+            .bind(directive)
+            .execute(&self.pool)
+            .await?;
+        Ok(id)
+    }
+
+    /// The oldest unacknowledged directive of the attempt, if it was never delivered or its
+    /// last delivery is older than `redeliver_after`. Later directives wait for it (order).
+    pub async fn next_directive(&self, attempt_id: Uuid, redeliver_after: Duration) -> Result<Option<(Uuid, Value)>> {
+        let row: Option<(Uuid, Value)> = sqlx::query_as(
+            "WITH head AS (
+                 SELECT id, delivered_at FROM environment_directives
+                 WHERE attempt_id = $1 AND acked_at IS NULL
+                 ORDER BY seq LIMIT 1 FOR UPDATE
+             )
+             UPDATE environment_directives d
+                SET delivered_at = now(), delivery_count = d.delivery_count + 1
+               FROM head
+              WHERE d.id = head.id
+                AND (head.delivered_at IS NULL OR head.delivered_at <= now() - $2::interval)
+             RETURNING d.id, d.directive",
+        )
+        .bind(attempt_id)
+        .bind(interval(redeliver_after))
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// runnerd acknowledged directive `id` (only its own attempt's directives).
+    pub async fn ack_directive(&self, attempt_id: Uuid, id: Uuid) -> Result<bool> {
+        let r = sqlx::query(
+            "UPDATE environment_directives SET acked_at = COALESCE(acked_at, now())
+             WHERE id = $1 AND attempt_id = $2",
+        )
+        .bind(id)
+        .bind(attempt_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    /// Directives of an attempt (tests, diagnostics): (id, directive, delivery_count, acked).
+    pub async fn directives_for_attempt(&self, attempt_id: Uuid) -> Result<Vec<(Uuid, Value, i32, bool)>> {
+        Ok(sqlx::query_as(
+            "SELECT id, directive, delivery_count, acked_at IS NOT NULL FROM environment_directives
+             WHERE attempt_id = $1 ORDER BY seq",
+        )
+        .bind(attempt_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     pub async fn touch_progress(&self, id: Uuid, at: DateTime<Utc>) -> Result<()> {
         sqlx::query(
             "UPDATE attempts SET last_progress_at = GREATEST(COALESCE(last_progress_at, $2), $2) WHERE id = $1",

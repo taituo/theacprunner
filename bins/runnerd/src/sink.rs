@@ -69,7 +69,7 @@ pub trait EventSink: Send {
     /// Buffer an event (sequence numbers are assigned by the sink).
     async fn emit(&mut self, ev: EventEnvelope);
     /// Liveness report; the controller may answer with a directive (e.g. cancel the agent).
-    async fn heartbeat(&mut self, hb: &HeartbeatData) -> Result<Option<RunnerDirective>, SinkError>;
+    async fn heartbeat(&mut self, hb: &HeartbeatData) -> Result<HeartbeatReply, SinkError>;
     async fn upload_artifact(&mut self, art: &ArtifactUpload) -> Result<ArtifactAccepted, SinkError>;
     async fn writeback(&mut self, key: &str, bytes: &[u8]) -> Result<(), SinkError>;
     async fn flush(&mut self) -> Result<(), SinkError>;
@@ -227,19 +227,19 @@ impl EventSink for IngestSink {
         }
     }
 
-    async fn heartbeat(&mut self, hb: &HeartbeatData) -> Result<Option<RunnerDirective>, SinkError> {
+    async fn heartbeat(&mut self, hb: &HeartbeatData) -> Result<HeartbeatReply, SinkError> {
         if !self.buffer.is_empty() {
             let _ = self.flush().await;
         }
         let r = self.post("/v1/attempt/heartbeat", hb, 2).await?;
         if r.status() == reqwest::StatusCode::NO_CONTENT {
-            return Ok(None);
+            return Ok(HeartbeatReply::default());
         }
         let body = r.bytes().await.map_err(|e| SinkError::Io(e.to_string()))?;
         if body.is_empty() {
-            return Ok(None);
+            return Ok(HeartbeatReply::default());
         }
-        Ok(serde_json::from_slice::<HeartbeatReply>(&body).map_err(|e| SinkError::Io(e.to_string()))?.directive)
+        serde_json::from_slice::<HeartbeatReply>(&body).map_err(|e| SinkError::Io(e.to_string()))
     }
 
     async fn upload_artifact(&mut self, art: &ArtifactUpload) -> Result<ArtifactAccepted, SinkError> {
@@ -334,8 +334,9 @@ impl EventSink for FileSink {
         ev.seq = Some(self.seq);
         let _ = self.append("events.jsonl", &serde_json::to_string(&ev).unwrap_or_default());
     }
-    async fn heartbeat(&mut self, hb: &HeartbeatData) -> Result<Option<RunnerDirective>, SinkError> {
-        self.append("heartbeats.jsonl", &serde_json::to_string(hb).unwrap_or_default()).map(|_| None)
+    async fn heartbeat(&mut self, hb: &HeartbeatData) -> Result<HeartbeatReply, SinkError> {
+        self.append("heartbeats.jsonl", &serde_json::to_string(hb).unwrap_or_default())
+            .map(|_| HeartbeatReply::default())
     }
     async fn upload_artifact(&mut self, art: &ArtifactUpload) -> Result<ArtifactAccepted, SinkError> {
         let bytes = art.patch_bytes().map_err(|e| SinkError::Io(e.to_string()))?;
@@ -392,9 +393,11 @@ impl EventSink for MemorySink {
         ev.seq = Some(self.seq);
         self.record.lock().expect("lock").events.push(ev);
     }
-    async fn heartbeat(&mut self, hb: &HeartbeatData) -> Result<Option<RunnerDirective>, SinkError> {
+    async fn heartbeat(&mut self, hb: &HeartbeatData) -> Result<HeartbeatReply, SinkError> {
         self.record.lock().expect("lock").heartbeats.push(hb.clone());
-        Ok(self.directives.lock().expect("lock").pop_front())
+        let directive = self.directives.lock().expect("lock").pop_front();
+        let directive_id = directive.as_ref().map(|_| uuid::Uuid::now_v7());
+        Ok(HeartbeatReply { directive, directive_id })
     }
     async fn upload_artifact(&mut self, art: &ArtifactUpload) -> Result<ArtifactAccepted, SinkError> {
         self.record.lock().expect("lock").artifacts.push(art.clone());

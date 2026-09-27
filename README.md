@@ -521,7 +521,13 @@ and a Role for Secrets in `acp-runner-system` (credential store). The agent serv
 **Controller replicas.** Safe to run more than one: every reconcile holds a
 transaction-scoped PostgreSQL advisory lock on the run; attempts carry a supervision lease
 (`lease_owner`, `lease_expires_at`, 45 s) — an instance that finds another live owner backs
-off; an expired lease is taken over (journaled as `Progress/supervision_takeover`).
+off; an expired lease is taken over (journaled as `Progress/supervision_takeover`). The
+ingest API keeps no authoritative state in memory: the heartbeat journaling rate limit is a
+column, and environment directives (snapshot/finish/cancel) are rows delivered in order on
+heartbeat replies and redelivered every 10 s until runnerd acknowledges them
+(`Progress/directive_ack`; runnerd de-duplicates by id). A recorded cancel always wins over
+queued directives. Tested with two engines on one database, not load-tested with several
+controller pods.
 
 ## 13. Sandbox and filesystem security
 
