@@ -134,14 +134,15 @@ async fn forbidden_environment_is_refused() {
 #[tokio::test]
 async fn refreshed_credentials_are_written_back_not_mutated_in_place() {
     let mut env = TestEnv::new(&Target::fake_acp()).await;
-    env.add_file_credential("codex", "auth.json", ".codex/auth.json", br#"{"auth_mode":"chatgpt","v":1}"#, true);
+    let original = br#"{"auth_mode":"chatgpt","tokens":{"refresh_token":"rt_acct-1_0"}}"#;
+    env.add_file_credential("codex", "auth.json", ".codex/auth.json", original, true);
     let (res, rec) = env.run("refresh-credential", |_| {}).await;
     assert_eq!(res.phase, AttemptPhase::Succeeded, "{:?}", res.reason);
     assert_eq!(rec.writebacks.len(), 1);
-    assert!(String::from_utf8_lossy(&rec.writebacks[0].1).contains("refreshed"));
+    assert!(String::from_utf8_lossy(&rec.writebacks[0].1).contains("rt_acct-1_1"), "rotated token handed back");
     // the mounted source is never modified
-    let mounted = std::fs::read_to_string(env.secret_dir.join("cred.auth.json")).unwrap();
-    assert_eq!(mounted, r#"{"auth_mode":"chatgpt","v":1}"#);
+    let mounted = std::fs::read(env.secret_dir.join("cred.auth.json")).unwrap();
+    assert_eq!(mounted, original);
 }
 
 #[tokio::test]

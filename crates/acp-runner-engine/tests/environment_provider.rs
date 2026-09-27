@@ -92,7 +92,8 @@ impl H {
         let harnesses = Arc::new(DirHarnessProvider::new(harness_root.clone()));
         let ingest = Arc::new(
             IngestState::new(journal.clone(), artifacts.clone(), creds.clone(), metrics, None)
-                .with_harnesses(harnesses.clone()),
+                .with_harnesses(harnesses.clone())
+                .with_refresher(Arc::new(acp_runner_engine::codex_refresh::testing::FakeRefresher::new())),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -453,7 +454,7 @@ fn fake_codex_auth(account: &str) -> Vec<u8> {
     json!({
         "auth_mode": "chatgpt", "OPENAI_API_KEY": null,
         "tokens": {"id_token": jwt(json!({"email":"a@example.com","https://api.openai.com/auth":{"chatgpt_plan_type":"plus","chatgpt_account_id":account}})),
-                   "access_token": jwt(json!({"exp": 1900000000})), "refresh_token": "rt_test_refresh_token_value_0000000000", "account_id": account},
+                   "access_token": jwt(json!({"exp": 1900000000})), "refresh_token": format!("rt_{account}_0"), "account_id": account},
         "last_refresh": "2026-09-20T00:00:00Z"
     })
     .to_string()
@@ -509,7 +510,8 @@ async fn environment_holds_an_exclusive_credential_lease_for_its_lifetime() {
     assert_eq!(done.phase, EnvironmentPhase::Completed, "{done:?}");
     // validated write-back happened before the release; the lease is gone
     let (_, stored) = h.creds.load("codex-1").await.unwrap();
-    assert!(String::from_utf8_lossy(&stored["auth.json"]).contains("\"refreshed\":true"));
+    let stored: serde_json::Value = serde_json::from_slice(&stored["auth.json"]).unwrap();
+    assert!(stored["tokens"]["access_token"].as_str().unwrap().starts_with("access-acct-1-"), "{stored}");
     assert!(h.provider.journal.active_leases().await.unwrap().is_empty());
     // now the profile is free again
     let b = h.provider.create(codex_spec("B2")).await.unwrap();
@@ -521,7 +523,7 @@ async fn environment_holds_an_exclusive_credential_lease_for_its_lifetime() {
         .await
         .unwrap()
         .join("\n");
-    assert!(!all.contains("rt_test_refresh_token_value"));
+    assert!(!all.contains("rt_acct-1_"));
     h.done().await;
 }
 

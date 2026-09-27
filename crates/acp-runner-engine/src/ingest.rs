@@ -68,6 +68,9 @@ pub struct IngestState {
     /// Each heartbeat extends the attempt's credential lease to at least now + this window.
     pub lease_heartbeat_window: Duration,
     redactor: Redactor,
+    /// Verifies refreshed Codex credentials at the provider before they are stored. Without
+    /// it, Codex write-backs are refused (fail closed).
+    pub refresher: Option<Arc<dyn crate::codex_refresh::TokenRefresher>>,
 }
 
 impl IngestState {
@@ -90,7 +93,13 @@ impl IngestState {
             harnesses: None,
             lease_heartbeat_window: Duration::from_secs(15 * 60),
             redactor: Redactor::new(),
+            refresher: None,
         }
+    }
+
+    pub fn with_refresher(mut self, r: Arc<dyn crate::codex_refresh::TokenRefresher>) -> Self {
+        self.refresher = Some(r);
+        self
     }
 
     pub fn with_harnesses(mut self, h: Arc<dyn crate::harness::HarnessProvider>) -> Self {
@@ -167,6 +176,37 @@ async fn authenticate(st: &IngestState, headers: &HeaderMap, allow_pending: bool
         return Err(ApiError(StatusCode::CONFLICT, format!("attempt is {}", a.phase)));
     }
     Ok(a)
+}
+
+/// How long after an attempt ended its runnerd may still hand a refreshed credential back
+/// (the controller may end an attempt — cancel, timeout — before runnerd's own shutdown path
+/// runs). The attempt must still hold its unreleased lease.
+pub const WRITEBACK_GRACE: Duration = Duration::from_secs(600);
+
+/// Like [`authenticate`], but also accepts a recently finished attempt (see [`WRITEBACK_GRACE`]).
+async fn authenticate_for_writeback(st: &IngestState, headers: &HeaderMap) -> ApiResult<AttemptRow> {
+    match authenticate(st, headers, false).await {
+        Err(ApiError(StatusCode::CONFLICT, _)) => {}
+        other => return other,
+    }
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .ok_or_else(|| ApiError(StatusCode::UNAUTHORIZED, "missing bearer token".into()))?;
+    let a = st
+        .journal
+        .attempt_by_token_hash(&token_hash(token))
+        .await?
+        .ok_or_else(|| ApiError(StatusCode::UNAUTHORIZED, "unknown token".into()))?;
+    let recent = a
+        .finished_at
+        .is_some_and(|f| chrono::Utc::now().signed_duration_since(f).to_std().is_ok_and(|d| d <= WRITEBACK_GRACE));
+    if a.phase().is_terminal() && recent {
+        Ok(a)
+    } else {
+        Err(ApiError(StatusCode::CONFLICT, format!("attempt is {}", a.phase)))
+    }
 }
 
 async fn get_spec(State(st): State<Arc<IngestState>>, headers: HeaderMap) -> ApiResult<Json<serde_json::Value>> {
@@ -533,7 +573,7 @@ async fn post_credential(
     headers: HeaderMap,
     Json(wb): Json<CredentialWriteback>,
 ) -> ApiResult<StatusCode> {
-    let a = authenticate(&st, &headers, false).await?;
+    let a = authenticate_for_writeback(&st, &headers).await?;
     let reject = |m: String| {
         st.metrics.writeback("rejected");
         tracing::warn!(attempt_id = %a.id, reason = %m, "credential write-back rejected");
@@ -542,10 +582,11 @@ async fn post_credential(
     let Some(profile) = a.credential_profile.clone() else {
         return Err(reject("attempt holds no credential".into()));
     };
-    let lease = st.journal.lease_for_attempt(a.id).await?;
-    if !lease.map(|l| l.released_at.is_none() && l.expires_at > chrono::Utc::now()).unwrap_or(false) {
+    // Hold the lease row locked until the store is updated: a concurrent release (and
+    // therefore the next holder's lease) waits for us.
+    let Some(lock) = st.journal.lock_active_lease(a.id).await? else {
         return Err(reject("attempt no longer holds the credential lease".into()));
-    }
+    };
     let prof = st.journal.get_profile(&profile).await?.ok_or_else(|| reject(format!("profile {profile} unknown")))?;
     let provider: Provider =
         prof.provider.parse().map_err(|e: acp_runner_core::credentials::CredentialError| reject(e.to_string()))?;
@@ -557,13 +598,41 @@ async fn post_credential(
     if bytes.len() > 256 * 1024 {
         return Err(reject("credential file too large".into()));
     }
-    let md = validate_writeback(provider, &enrolled, &wb.key, &bytes).map_err(|e| reject(e.to_string()))?;
+    // Structural policy first (key whitelist, no API keys, refreshable auth mode).
+    validate_writeback(provider, &enrolled, &wb.key, &bytes).map_err(|e| reject(e.to_string()))?;
+    // The submitted file is untrusted: never store it. Redeem its refresh token at the
+    // provider, verify the returned id_token and store only what the controller obtained.
+    let to_store = match provider {
+        Provider::Codex => {
+            let Some(refresher) = st.refresher.clone() else {
+                return Err(reject("write-back verification is not configured (ACP_RUNNER_CODEX_WRITEBACK)".into()));
+            };
+            let submitted: serde_json::Value =
+                serde_json::from_slice(&bytes).map_err(|_| reject("auth.json is not JSON".into()))?;
+            let Some(rt) = submitted.pointer("/tokens/refresh_token").and_then(|v| v.as_str()) else {
+                return Err(reject("auth.json has no refresh token".into()));
+            };
+            let t = refresher.refresh(rt).await.map_err(|e| reject(format!("provider refresh failed: {e}")))?;
+            let Some(acct) = t.account_id() else {
+                return Err(reject("verified id_token carries no account".into()));
+            };
+            if enrolled.account_fingerprint.as_deref() != Some(fingerprint(acct.as_bytes()).as_str()) {
+                return Err(reject("refreshed credential belongs to another account".into()));
+            }
+            crate::codex_refresh::rebuild_auth_json(&t)
+        }
+        Provider::Claude => return Err(reject("claude credentials are not written back".into())),
+    };
+    let md = validate_writeback(provider, &enrolled, &wb.key, &to_store).map_err(|e| reject(e.to_string()))?;
     st.creds
-        .update_file(&profile, &wb.key, &bytes, &md)
+        .update_file(&profile, &wb.key, &to_store, &md)
         .await
         .map_err(|e| ApiError(StatusCode::SERVICE_UNAVAILABLE, format!("credential store: {e}")))?;
-    st.journal.record_writeback(&profile, &serde_json::to_value(&md).unwrap_or_default(), &fingerprint(&bytes)).await?;
+    lock.commit().await?;
+    st.journal
+        .record_writeback(&profile, &serde_json::to_value(&md).unwrap_or_default(), &fingerprint(&to_store))
+        .await?;
     st.metrics.writeback("accepted");
-    tracing::info!(attempt_id = %a.id, profile = %profile, "refreshed credential written back");
+    tracing::info!(attempt_id = %a.id, profile = %profile, "refreshed credential verified at the provider and stored");
     Ok(StatusCode::NO_CONTENT)
 }

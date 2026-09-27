@@ -408,6 +408,40 @@ async fn controller_end_to_end_on_a_real_apiserver() {
     let fake = target_dir().join("fake-acp-agent");
     let _kubelet = FakeKubelet::start(client.clone(), ns.clone(), tmp.path().join("nodes"));
 
+    // Fake OAuth issuer for verified Codex write-back (token endpoint + JWKS file).
+    let issuer = std::sync::Arc::new(acp_runner_engine::codex_refresh::testing::TestIssuer::new());
+    let jwks_file = tmp.path().join("jwks.json");
+    std::fs::write(&jwks_file, issuer.jwks()).unwrap();
+    let token_port = free_port();
+    {
+        let issuer = issuer.clone();
+        let app = axum::Router::new().route(
+            "/oauth/token",
+            axum::routing::post(move |axum::Json(b): axum::Json<serde_json::Value>| {
+                let issuer = issuer.clone();
+                async move {
+                    use acp_runner_engine::codex_refresh::{DEFAULT_CLIENT_ID, DEFAULT_ISSUER};
+                    let rt = b["refresh_token"].as_str().unwrap_or_default().to_string();
+                    let Some(acct) =
+                        rt.strip_prefix("rt_").and_then(|r| r.rsplit_once('_').map(|(a, _)| a.to_string()))
+                    else {
+                        return (axum::http::StatusCode::BAD_REQUEST, axum::Json(json!({"error": "invalid_grant"})));
+                    };
+                    (
+                        axum::http::StatusCode::OK,
+                        axum::Json(json!({
+                            "id_token": issuer.id_token(DEFAULT_ISSUER, DEFAULT_CLIENT_ID, &acct),
+                            "access_token": format!("access-{acct}-kube-000000000000"),
+                            "refresh_token": format!("rt_{acct}_77"),
+                        })),
+                    )
+                }
+            }),
+        );
+        let l = tokio::net::TcpListener::bind(("127.0.0.1", token_port)).await.unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    }
+
     // controller process
     let (ingest_port, metrics_port) = (free_port(), free_port());
     let log = std::fs::File::create(tmp.path().join("controller.log")).unwrap();
@@ -427,6 +461,8 @@ async fn controller_end_to_end_on_a_real_apiserver() {
         .env("ACP_RUNNER_CREDENTIAL_NAMESPACE", &ns)
         .env("ACP_RUNNER_STRICT_POSTURE", "false")
         .env("ACP_RUNNER_ALLOW_FILE_REPOS", "true")
+        .env("ACP_RUNNER_CODEX_TOKEN_URL", format!("http://127.0.0.1:{token_port}/oauth/token"))
+        .env("ACP_RUNNER_CODEX_JWKS", format!("file:{}", jwks_file.display()))
         .env("RUST_LOG", "info")
         .stdout(log.try_clone().unwrap())
         .stderr(log)
@@ -525,7 +561,7 @@ async fn controller_end_to_end_on_a_real_apiserver() {
     bundle.insert(
         "auth.json".into(),
         json!({"auth_mode":"chatgpt","OPENAI_API_KEY":null,"tokens":{"id_token": jwt(json!({"https://api.openai.com/auth":{"chatgpt_account_id":"acct-9"}})),
-            "access_token": jwt(json!({"exp":1900000000})),"refresh_token":"rt_e2e_refresh_token_value_000000000","account_id":"acct-9"}})
+            "access_token": jwt(json!({"exp":1900000000})),"refresh_token":"rt_acct-9_0","account_id":"acct-9"}})
         .to_string()
         .into_bytes(),
     );
@@ -562,8 +598,10 @@ async fn controller_end_to_end_on_a_real_apiserver() {
     let st = r.status.unwrap();
     assert_eq!(st.phase.as_deref(), Some("Succeeded"), "{st:?}");
     assert_eq!(st.credential_profile.as_deref(), Some("codex-e2e"));
+    // stored: the tokens the controller obtained from the (fake) provider, not the sandbox's
     let (_, b) = store.load("codex-e2e").await.unwrap();
-    assert!(String::from_utf8_lossy(&b["auth.json"]).contains("\"refreshed\":true"));
+    let stored: serde_json::Value = serde_json::from_slice(&b["auth.json"]).unwrap();
+    assert_eq!(stored["tokens"]["refresh_token"], "rt_acct-9_77", "{stored}");
 
     // 4. deletion -> finalizer cancels, terminates the sandbox, releases the lease
     runs.create(&pp, &run("doomed", "fake-hang", &[], &repo, &sha, 1)).await.unwrap();

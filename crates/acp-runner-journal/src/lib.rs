@@ -162,6 +162,19 @@ pub struct LeaseRow {
     pub released_at: Option<DateTime<Utc>>,
 }
 
+/// A locked credential lease row (see [`Journal::lock_active_lease`]).
+pub struct LeaseLock {
+    tx: sqlx::Transaction<'static, sqlx::Postgres>,
+    pub lease: LeaseRow,
+}
+
+impl LeaseLock {
+    pub async fn commit(self) -> Result<()> {
+        self.tx.commit().await?;
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct NewRun {
     pub id: Uuid,
@@ -885,6 +898,21 @@ impl Journal {
             .bind(attempt_id)
             .fetch_optional(&self.pool)
             .await?)
+    }
+
+    /// Lock the attempt's active (unreleased, unexpired) lease row until the returned guard
+    /// is committed or dropped. Releasing the lease (`release_lease`) waits for the guard, so a
+    /// credential write-back checked under this lock cannot race a release.
+    pub async fn lock_active_lease(&self, attempt_id: Uuid) -> Result<Option<LeaseLock>> {
+        let mut tx = self.pool.begin().await?;
+        let lease: Option<LeaseRow> = sqlx::query_as(
+            "SELECT * FROM credential_leases
+             WHERE attempt_id = $1 AND released_at IS NULL AND expires_at > now() FOR UPDATE",
+        )
+        .bind(attempt_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        Ok(lease.map(|lease| LeaseLock { tx, lease }))
     }
 
     /// Extend an active lease to at least `now + window` (never shortens it).

@@ -80,6 +80,15 @@ sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio",
 # http
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "http2"] }
+# Engine-side HTTPS (Codex write-back verification) on the hyper/rustls stack kube already
+# uses, with an explicit ring provider: no process-wide TLS default is changed.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+ring = "0.17"
+hyper = { version = "1", default-features = false }
+hyper-util = { version = "0.1", default-features = false, features = ["client-legacy", "http1", "tokio"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "native-tokio", "tls12"] }
+http-body-util = "0.1"
+bytes = "1"
 prometheus-client = "0.25"
 
 [profile.dev]

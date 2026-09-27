@@ -29,6 +29,7 @@
 pub mod backend;
 pub mod bundles;
 pub mod capsule;
+pub mod codex_refresh;
 pub mod compat;
 pub mod creds;
 pub mod environment;
@@ -97,6 +98,9 @@ impl Default for EngineConfig {
         }
     }
 }
+
+/// Requeue interval while a finished attempt's sandbox is still terminating.
+const CLEANUP_REQUEUE: Duration = Duration::from_secs(2);
 
 pub struct Engine {
     pub journal: Journal,
@@ -217,7 +221,9 @@ impl Engine {
         lock.release().await?;
         let requeue = res?;
         let mut v = self.view(run.id).await?;
-        v.requeue_after = if v.phase.is_terminal() { None } else { Some(requeue) };
+        // A finished run is revisited only while its cleanup (sandbox gone, lease released)
+        // is still pending.
+        v.requeue_after = if v.phase.is_terminal() { (!requeue.is_zero()).then_some(requeue) } else { Some(requeue) };
         Ok(v)
     }
 
@@ -228,7 +234,7 @@ impl Engine {
             if let Some(lock) = self.journal.try_lock_run(run.id).await? {
                 let run = self.journal.get_run(run.id).await?;
                 let r = if run.phase().is_terminal() {
-                    self.cleanup_terminal(&run).await
+                    self.cleanup_terminal(&run).await.map(|_| ())
                 } else {
                     self.cancel_locked(&run, detail).await
                 };
@@ -243,8 +249,8 @@ impl Engine {
     async fn reconcile_locked(&self, run_id: Uuid, input: &RunInput) -> Result<Duration> {
         let run = self.journal.get_run(run_id).await?;
         if run.phase().is_terminal() {
-            self.cleanup_terminal(&run).await?;
-            return Ok(Duration::ZERO);
+            let done = self.cleanup_terminal(&run).await?;
+            return Ok(if done { Duration::ZERO } else { CLEANUP_REQUEUE });
         }
         // The spec is snapshotted at creation: later edits do not affect an in-flight run.
         let spec: RunSpec = serde_json::from_value(run.spec.clone())?;
@@ -287,8 +293,9 @@ impl Engine {
             }
         }
         let attempts = self.journal.attempts_for_run(run.id).await?;
+        let mut cleaned = true;
         if let Some(last) = attempts.last() {
-            self.attempt_cleanup(last).await?;
+            cleaned = self.attempt_cleanup(last).await?;
             if last.phase() == AttemptPhase::Succeeded {
                 self.journal.set_run_phase(run.id, RunPhase::Succeeded, None, last.artifact_id).await?;
                 self.controller_event(
@@ -301,7 +308,7 @@ impl Engine {
                 .await;
                 self.metrics.run("succeeded");
                 tracing::info!(run_id = %run.id, attempt_id = %last.id, driver = %last.driver, "run succeeded");
-                return Ok(Duration::ZERO);
+                return Ok(if cleaned { Duration::ZERO } else { CLEANUP_REQUEUE });
             }
         }
         let history: Vec<FinishedAttempt> = attempts
@@ -318,7 +325,7 @@ impl Engine {
                     .and_then(|a| a.failure())
                     .unwrap_or_else(|| FailureReason::internal("no attempt could be planned"));
                 self.fail_run(&run, reason).await?;
-                Ok(Duration::ZERO)
+                Ok(if cleaned { Duration::ZERO } else { CLEANUP_REQUEUE })
             }
             Some(next) => self.start_attempt(&run, &spec, &attempts, next).await,
         }
@@ -353,7 +360,9 @@ impl Engine {
         Ok(())
     }
 
-    async fn cleanup_terminal(&self, run: &RunRow) -> Result<()> {
+    /// Clean up every attempt of a finished run. `Ok(true)` when nothing is pending.
+    async fn cleanup_terminal(&self, run: &RunRow) -> Result<bool> {
+        let mut done = true;
         for a in self.journal.attempts_for_run(run.id).await? {
             if a.phase().is_active() {
                 let reason = FailureReason::Cancelled { detail: "run already finished".into() };
@@ -364,28 +373,40 @@ impl Engine {
             if a.sandbox_released_at.is_none()
                 || self.journal.lease_for_attempt(a.id).await?.is_some_and(|l| l.released_at.is_none())
             {
-                self.attempt_cleanup(&self.journal.get_attempt(a.id).await?).await?;
+                done &= self.attempt_cleanup(&self.journal.get_attempt(a.id).await?).await?;
             }
         }
-        Ok(())
+        Ok(done)
     }
 
     /// Idempotent side effects of a finished attempt: sandbox terminated, lease released,
     /// credential profile flagged when the provider rejected it.
-    async fn attempt_cleanup(&self, a: &AttemptRow) -> Result<()> {
-        if let Some(sref) = &a.sandbox_ref
-            && a.sandbox_released_at.is_none()
-        {
+    ///
+    /// The credential lease is released only once the backend reports the sandbox gone (or
+    /// its processes exited): a deleted pod keeps running through its termination grace
+    /// period, and an exclusive credential must never be used by two sandboxes at once. Until
+    /// then the lease stays held (its expiry is the backstop) and the caller requeues.
+    /// Returns `Ok(true)` when the sandbox is gone and the lease released.
+    async fn attempt_cleanup(&self, a: &AttemptRow) -> Result<bool> {
+        let mut gone = a.sandbox_released_at.is_some() || a.sandbox_ref.is_none();
+        if !gone && let Some(sref) = &a.sandbox_ref {
             let sref: SandboxRef = serde_json::from_value(sref.clone())?;
             let grace = serde_json::from_value::<AttemptSpec>(a.spec.clone())
                 .map(|s| Duration::from_secs(s.timeouts.grace_seconds))
                 .unwrap_or(Duration::from_secs(20));
             match self.backend.terminate(&sref, grace).await {
-                Ok(()) => self.journal.mark_sandbox_released(a.id).await?,
+                Ok(()) => match self.backend.observe(&sref).await {
+                    Ok(SandboxObservation::Missing | SandboxObservation::Exited { .. }) => {
+                        self.journal.mark_sandbox_released(a.id).await?;
+                        gone = true;
+                    }
+                    Ok(_) => tracing::debug!(attempt_id = %a.id, "sandbox still terminating; lease kept"),
+                    Err(e) => tracing::warn!(attempt_id = %a.id, error = %e, "sandbox state unknown; lease kept"),
+                },
                 Err(e) => tracing::warn!(attempt_id = %a.id, error = %e, "sandbox termination failed; will retry"),
             }
         }
-        if self.journal.release_lease(a.id).await? {
+        if gone && self.journal.release_lease(a.id).await? {
             tracing::debug!(attempt_id = %a.id, "credential lease released");
         }
         if let (Some(profile), Some(reason)) = (&a.credential_profile, a.failure()) {
@@ -402,7 +423,7 @@ impl Engine {
                 tracing::warn!(profile, status, "credential profile flagged");
             }
         }
-        Ok(())
+        Ok(gone)
     }
 
     async fn supervise(&self, run: &RunRow, spec: &RunSpec, a: &AttemptRow) -> Result<Duration> {

@@ -346,6 +346,14 @@ pub fn validate_writeback(
     if !spec.files.iter().any(|f| f.key == key && f.writeback) {
         return Err(CredentialError::UnexpectedKey(key.to_string()));
     }
+    // Only a ChatGPT login refreshes itself; personal access tokens and agent identities are
+    // static, so a changed file from the sandbox is never a legitimate refresh.
+    if provider == Provider::Codex && enrolled.auth_kind != "chatgpt" {
+        return Err(CredentialError::UnsupportedAuthMode(format!(
+            "{} credentials are not refreshed by the CLI; write-back refused",
+            enrolled.auth_kind
+        )));
+    }
     let mut bundle = CredentialBundle::new();
     bundle.insert(key.to_string(), new_bytes.to_vec());
     let md = validate_bundle(provider, &bundle)?;
@@ -445,5 +453,21 @@ pub(crate) mod tests {
             Err(CredentialError::AccountMismatch)
         );
         assert!(validate_writeback(Provider::Claude, &enrolled, "oauth-token", b"sk-ant-oat01-xxxxxxxxxxxx").is_err());
+    }
+
+    /// Review finding 1 (structural half): static auth modes never accept a write-back. The
+    /// account half (a forged token next to a copied account id) is decided by the controller
+    /// redeeming the token at the provider (engine `codex_refresh`, e2e tests).
+    #[test]
+    fn static_auth_modes_refuse_writeback() {
+        let pat =
+            |v: &str| serde_json::json!({"auth_mode": "personalAccessToken", "personal_access_token": v}).to_string();
+        let mut b = CredentialBundle::new();
+        b.insert("auth.json".into(), pat("victim-pat").into_bytes());
+        let enrolled = validate_bundle(Provider::Codex, &b).unwrap();
+        assert!(matches!(
+            validate_writeback(Provider::Codex, &enrolled, "auth.json", pat("attacker-pat").as_bytes()),
+            Err(CredentialError::UnsupportedAuthMode(_))
+        ));
     }
 }

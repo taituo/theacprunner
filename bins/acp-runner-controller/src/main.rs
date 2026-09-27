@@ -109,6 +109,20 @@ pub struct RunArgs {
     /// `egress.mode: direct` (unrestricted public egress).
     #[arg(long, env = "ACP_RUNNER_ALLOW_DIRECT_CREDENTIAL_EGRESS", default_value_t = false, action = clap::ArgAction::Set)]
     pub allow_direct_credential_egress: bool,
+    /// Codex credential write-back: `verify` redeems the handed-back refresh token at the
+    /// provider and stores only verified, controller-obtained tokens; `disabled` refuses every
+    /// Codex write-back (profiles then need re-enrollment when tokens rotate).
+    #[arg(long, env = "ACP_RUNNER_CODEX_WRITEBACK", default_value = "verify")]
+    pub codex_writeback: String,
+    #[arg(long, env = "ACP_RUNNER_CODEX_TOKEN_URL", default_value = acp_runner_engine::codex_refresh::DEFAULT_TOKEN_URL)]
+    pub codex_token_url: String,
+    #[arg(long, env = "ACP_RUNNER_CODEX_CLIENT_ID", default_value = acp_runner_engine::codex_refresh::DEFAULT_CLIENT_ID)]
+    pub codex_client_id: String,
+    #[arg(long, env = "ACP_RUNNER_CODEX_ISSUER", default_value = acp_runner_engine::codex_refresh::DEFAULT_ISSUER)]
+    pub codex_issuer: String,
+    /// JWKS URL, or `file:<path>` for a mounted key set.
+    #[arg(long, env = "ACP_RUNNER_CODEX_JWKS", default_value = acp_runner_engine::codex_refresh::DEFAULT_JWKS_URL)]
+    pub codex_jwks: String,
     /// Accept `file://` repository URLs (fixtures baked into the runner image).
     #[arg(long, env = "ACP_RUNNER_ALLOW_FILE_REPOS", default_value_t = false, action = clap::ArgAction::Set)]
     pub allow_file_repos: bool,
@@ -213,8 +227,29 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     tracing::info!(controller_id = %controller_id, backend = ?args.backend, "starting acp-runner controller");
 
     // ingest API (runnerd -> controller)
-    let ingest_state =
-        Arc::new(IngestState::new(journal.clone(), artifacts.clone(), creds.clone(), metrics.clone(), None));
+    let mut ingest_state = IngestState::new(journal.clone(), artifacts.clone(), creds.clone(), metrics.clone(), None);
+    match args.codex_writeback.as_str() {
+        "verify" => {
+            use acp_runner_engine::codex_refresh::{JwksSource, OAuthRefresher, RefresherConfig};
+            let jwks = match args.codex_jwks.strip_prefix("file:") {
+                Some(path) => {
+                    JwksSource::Static(std::fs::read_to_string(path).context("reading ACP_RUNNER_CODEX_JWKS")?)
+                }
+                None => JwksSource::Url(args.codex_jwks.clone()),
+            };
+            let refresher = OAuthRefresher::new(RefresherConfig {
+                token_url: args.codex_token_url.clone(),
+                client_id: args.codex_client_id.clone(),
+                issuer: args.codex_issuer.clone(),
+                jwks,
+                ..Default::default()
+            })?;
+            ingest_state = ingest_state.with_refresher(Arc::new(refresher));
+        }
+        "disabled" => tracing::warn!("ACP_RUNNER_CODEX_WRITEBACK=disabled: refreshed Codex credentials are not stored"),
+        other => anyhow::bail!("ACP_RUNNER_CODEX_WRITEBACK must be verify or disabled, not {other:?}"),
+    }
+    let ingest_state = Arc::new(ingest_state);
     let ingest_listener = tokio::net::TcpListener::bind(&args.ingest_listen).await?;
     tokio::spawn(async move {
         if let Err(e) = axum::serve(ingest_listener, router(ingest_state)).await {

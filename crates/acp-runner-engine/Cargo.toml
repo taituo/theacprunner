@@ -28,8 +28,23 @@ prometheus-client.workspace = true
 nix.workspace = true
 anyhow.workspace = true
 futures.workspace = true
+# Controller-side verification of refreshed Codex credentials (write-back): OAuth refresh over
+# HTTPS (hyper + rustls with an explicit ring provider) and RS256 id_token signatures.
+rustls.workspace = true
+ring.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+hyper-rustls.workspace = true
+http-body-util.workspace = true
+bytes.workspace = true
+
+[features]
+# Test helpers (fake OAuth issuer/refresher) for this crate's integration tests and the
+# controller's Kubernetes e2e test. Never enabled for release builds.
+test-support = []
 
 [dev-dependencies]
+acp-runner-engine = { path = ".", features = ["test-support"] }
 tempfile.workspace = true
 sqlx.workspace = true
 tar.workspace = true

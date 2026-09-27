@@ -93,13 +93,18 @@ async fn advisory_run_lock_is_exclusive() {
     assert!(j.try_lock_run(id).await.unwrap().is_none());
     assert!(j.try_lock_run(Uuid::now_v7()).await.unwrap().is_some());
     l1.release().await.unwrap();
-    assert!(j.try_lock_run(id).await.unwrap().is_some());
+    // release explicitly: a dropped lock is rolled back asynchronously by the pool
+    j.try_lock_run(id).await.unwrap().expect("lock after release").release().await.unwrap();
     // dropping without release also frees it (transaction rollback)
     {
         let _l = j.try_lock_run(id).await.unwrap().unwrap();
     }
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert!(j.try_lock_run(id).await.unwrap().is_some());
+    // the rollback of a dropped transaction happens asynchronously: poll briefly
+    let start = std::time::Instant::now();
+    while j.try_lock_run(id).await.unwrap().is_none() {
+        assert!(start.elapsed() < Duration::from_secs(5), "dropped lock was never released");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     db.drop_db().await;
 }
 

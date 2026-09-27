@@ -40,7 +40,7 @@
 //! | `escape-symlink`    | creates `evil -> /etc/passwd`                                        |
 //! | `huge`              | writes a ~2 MiB file                                                 |
 //! | `write-outside`     | writes outside the repository, then `fix`                           |
-//! | `refresh-credential`| rewrites `$HOME/.codex/auth.json` (token refresh), then `fix`        |
+//! | `refresh-credential[:forge|:hang]` | rotates the refresh token in `$HOME/.codex/auth.json`, then `fix` (`forge`: plants a foreign token; `hang`: refresh, then hang) |
 //! | `api-key-mode`      | reports API-key auth (codex-acp `_auth/status_update`)              |
 //! | `read:PATH`         | replies with the content of PATH (relative to the session cwd)      |
 //! | `touch:NAME`        | writes NAME (relative to the session cwd), ends the turn            |
@@ -407,16 +407,32 @@ fn run_turn(sh: Arc<Shared>, id: Value, sid: String, scen: String) {
             eprintln!("fake-acp-agent stderr leak: {leaked}");
         }
         "refresh-credential" => {
-            // Simulates Codex refreshing its ChatGPT tokens in $CODEX_HOME/auth.json.
+            // Simulates Codex refreshing its ChatGPT tokens in $CODEX_HOME/auth.json: the
+            // refresh token rotates (`rt_<account>_<n>` -> `rt_<account>_<n+1>`, the format the
+            // test refresher accepts). `:forge` instead plants an attacker's refresh token next
+            // to the victim's account id; `:hang` refreshes and then hangs until cancelled.
             if let Ok(home) = std::env::var("HOME") {
                 let p = Path::new(&home).join(".codex/auth.json");
                 if let Ok(s) = std::fs::read_to_string(&p)
                     && let Ok(mut v) = serde_json::from_str::<Value>(&s)
                 {
-                    v["refreshed"] = json!(true);
+                    let rt = v.pointer("/tokens/refresh_token").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                    let rotated = match rt.rsplit_once('_') {
+                        Some((base, n)) => format!("{base}_{}", n.parse::<u64>().unwrap_or(0) + 1),
+                        None => format!("{rt}_1"),
+                    };
+                    v["tokens"]["refresh_token"] =
+                        json!(if arg == "forge" { "rt_attacker_0".to_string() } else { rotated });
                     v["last_refresh"] = json!("2026-09-26T00:00:00Z");
                     let _ = std::fs::write(&p, v.to_string());
                 }
+            }
+            if arg == "hang" {
+                while !sh.cancelled.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                end_turn(&sh, id, "cancelled");
+                return;
             }
         }
         "escape-symlink" => {

@@ -35,4 +35,5 @@ uuid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+acp-runner-engine = { workspace = true, features = ["test-support"] }
 nix.workspace = true

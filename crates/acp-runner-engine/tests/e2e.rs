@@ -64,8 +64,11 @@ impl H {
         let metrics = Arc::new(Metrics::new());
         let artifacts: Arc<dyn ArtifactStore> = Arc::new(PgArtifactStore::new(journal.clone(), inline_limit, None));
         let creds = Arc::new(FileCredentialStore { root: tmp.path().join("creds") });
-        let state =
-            Arc::new(IngestState::new(journal.clone(), artifacts.clone(), creds.clone(), metrics.clone(), None));
+        let refresher = Arc::new(acp_runner_engine::codex_refresh::testing::FakeRefresher::new());
+        let state = Arc::new(
+            IngestState::new(journal.clone(), artifacts.clone(), creds.clone(), metrics.clone(), None)
+                .with_refresher(refresher),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap() });
@@ -451,7 +454,7 @@ fn fake_codex_auth(account: &str) -> Vec<u8> {
     json!({
         "auth_mode": "chatgpt", "OPENAI_API_KEY": null,
         "tokens": {"id_token": jwt(json!({"email":"a@example.com","https://api.openai.com/auth":{"chatgpt_plan_type":"plus","chatgpt_account_id":account}})),
-                   "access_token": jwt(json!({"exp": 1900000000})), "refresh_token": "rt_test_refresh_token_value_0000000000", "account_id": account},
+                   "access_token": jwt(json!({"exp": 1900000000})), "refresh_token": format!("rt_{account}_0"), "account_id": account},
         "last_refresh": "2026-09-20T00:00:00Z"
     })
     .to_string()
@@ -503,9 +506,12 @@ async fn exclusive_credential_lease_serializes_runs_and_writeback_is_validated()
     assert_eq!(a.phase, RunPhase::Succeeded, "{a:?}");
     assert_eq!(b.phase, RunPhase::Succeeded, "{b:?}");
     assert!(h.engine.journal.active_leases().await.unwrap().is_empty());
-    // the refreshed auth.json went through validated write-back into the store
+    // the handed-back refresh token was redeemed by the controller; the store holds the
+    // controller-obtained tokens, never the submitted bytes
     let (_, bundle) = h.creds.load("codex-1").await.unwrap();
-    assert!(String::from_utf8_lossy(&bundle["auth.json"]).contains("\"refreshed\":true"));
+    let stored: serde_json::Value = serde_json::from_slice(&bundle["auth.json"]).unwrap();
+    assert!(stored["tokens"]["refresh_token"].as_str().unwrap().starts_with("rt_acct-1_10"), "{stored}");
+    assert!(stored["tokens"]["access_token"].as_str().unwrap().starts_with("access-acct-1-"));
     let p = h.engine.journal.get_profile("codex-1").await.unwrap().unwrap();
     assert!(p.generation >= 1);
     assert!(h.metrics.render().contains("acp_runner_credential_writebacks_total{result=\"accepted\"} 1"));
@@ -576,9 +582,10 @@ async fn claude_failure_falls_back_to_codex_with_refresh_writeback() {
     // resume capsule across providers
     let spec2: acp_runner_core::AttemptSpec = serde_json::from_value(attempts[1].spec.clone()).unwrap();
     assert!(spec2.prompt.contains("AuthEnrollmentRequired"), "{}", spec2.prompt);
-    // Codex refreshed its auth.json; the refreshed copy went through validated write-back
+    // Codex refreshed its auth.json; the controller redeemed the token and stored its own
     let (_, bundle) = h.creds.load("codex-personal-1").await.unwrap();
-    assert!(String::from_utf8_lossy(&bundle["auth.json"]).contains("\"refreshed\":true"));
+    let stored: serde_json::Value = serde_json::from_slice(&bundle["auth.json"]).unwrap();
+    assert_eq!(stored["tokens"]["account_id"], "acct-1");
     assert!(h.metrics.render().contains("acp_runner_credential_writebacks_total{result=\"accepted\"} 1"));
     // agent events are tagged as untrusted, the terminal events as runnerd's
     let evs = h.engine.journal.events_for_run(v.run_id, 0, 10_000).await.unwrap();
@@ -587,7 +594,7 @@ async fn claude_failure_falls_back_to_codex_with_refresh_writeback() {
     assert_eq!(evs.iter().filter(|e| e.kind == "SessionStarted").count(), 2);
     // no credential material anywhere in the journal
     let all = serde_json::to_string(&evs.iter().map(|e| (&e.data, &e.raw)).collect::<Vec<_>>()).unwrap();
-    for secret in [FAKE_CLAUDE_TOKEN, "rt_test_refresh_token_value_0000000000"] {
+    for secret in [FAKE_CLAUDE_TOKEN, "rt_acct-1_0", "rt_acct-1_1"] {
         assert!(!all.contains(secret), "credential leaked into the journal");
     }
     h.done().await;
@@ -764,6 +771,62 @@ async fn file_repositories_are_refused_unless_enabled() {
     assert_eq!(v.phase, RunPhase::Failed, "{v:?}");
     assert_eq!(v.attempt_count, 0);
     assert!(v.failure.unwrap().message().contains("file://"));
+    h.done().await;
+}
+
+/// Review finding 1: an agent that plants its own refresh token next to the victim's account
+/// id cannot get it into the credential store.
+#[tokio::test]
+async fn forged_credential_writeback_is_rejected_and_the_store_is_unchanged() {
+    let Some(h) = H::new().await else { return };
+    enroll_codex(&h, "codex-1").await;
+    let before = h.creds.load("codex-1").await.unwrap().1["auth.json"].clone();
+    let mut c = h.class("codexish-forge", "refresh-credential:forge");
+    c.credentials = CredentialRequirement {
+        provider: Some("codex".into()),
+        profiles: vec!["codex-1".into()],
+        file_targets: BTreeMap::new(),
+    };
+    let v = h.drive(&h.input(vec![c], 1), Duration::from_secs(60)).await;
+    assert_eq!(v.phase, RunPhase::Succeeded, "the run itself is unaffected: {v:?}");
+    assert_eq!(h.creds.load("codex-1").await.unwrap().1["auth.json"], before, "forged credential was stored");
+    assert!(h.metrics.render().contains("acp_runner_credential_writebacks_total{result=\"rejected\"} 1"));
+    let evs = h.engine.journal.events_for_run(v.run_id, 0, 10_000).await.unwrap();
+    assert!(evs.iter().any(|e| e.data.get("category").and_then(|c| c.as_str()) == Some("credential_writeback_failed")));
+    h.done().await;
+}
+
+/// Review finding 10: when the controller ends an attempt (cancel), runnerd's write-back on
+/// its way out is still accepted while the attempt holds its lease; the lease is released only
+/// after the sandbox is gone.
+#[tokio::test]
+async fn writeback_after_controller_cancel_is_accepted() {
+    let Some(h) = H::new().await else { return };
+    enroll_codex(&h, "codex-1").await;
+    let mut c = h.class("codexish-hang", "refresh-credential:hang");
+    c.credentials = CredentialRequirement {
+        provider: Some("codex".into()),
+        profiles: vec!["codex-1".into()],
+        file_targets: BTreeMap::new(),
+    };
+    let mut input = h.input(vec![c], 1);
+    let start = Instant::now();
+    loop {
+        let v = h.engine.reconcile(&input).await.unwrap();
+        if v.current.as_ref().is_some_and(|c| c.phase == AttemptPhase::Running) {
+            break;
+        }
+        assert!(start.elapsed() < Duration::from_secs(30));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(800)).await; // the agent has refreshed by now
+    input.cancel = true;
+    let v = h.drive(&input, Duration::from_secs(60)).await;
+    assert_eq!(v.phase, RunPhase::Cancelled, "{v:?}");
+    let stored: serde_json::Value =
+        serde_json::from_slice(&h.creds.load("codex-1").await.unwrap().1["auth.json"]).unwrap();
+    assert!(stored["tokens"]["access_token"].as_str().unwrap().starts_with("access-acct-1-"), "{stored}");
+    assert!(h.engine.journal.active_leases().await.unwrap().is_empty());
     h.done().await;
 }
 
