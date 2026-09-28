@@ -11,6 +11,7 @@
 set -euo pipefail
 
 BIN=${ENVTEST_BIN:?set ENVTEST_BIN to a directory containing kube-apiserver, etcd, kubectl}
+BIN=$(cd "$BIN" && pwd)   # absolute: the script changes directory below
 DIR=${ENVTEST_DIR:-${TMPDIR:-/tmp}/acp-runner-envtest}
 API_PORT=${ENVTEST_API_PORT:-16443}
 ETCD_PORT=${ENVTEST_ETCD_PORT:-12379}

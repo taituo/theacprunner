@@ -38,7 +38,7 @@ jobs:
         run: |
           curl -sSL -o envtest.tgz "https://github.com/kubernetes-sigs/controller-tools/releases/download/envtest-${ENVTEST_VERSION}/envtest-${ENVTEST_VERSION}-linux-amd64.tar.gz"
           mkdir -p .cache/envtest && tar xzf envtest.tgz -C .cache/envtest
-          APISERVER=$(find .cache/envtest -name kube-apiserver -type f | head -1)
+          APISERVER=$(find "$PWD/.cache/envtest" -name kube-apiserver -type f | head -1)
           [ -n "$APISERVER" ] || { echo "::error::kube-apiserver not found in the envtest bundle"; find .cache/envtest | head -20; exit 1; }
           if ! KCFG=$(ENVTEST_BIN=$(dirname "$APISERVER") ENVTEST_READY_SECONDS=180 scripts/envtest-up.sh); then
             for f in /tmp/acp-runner-envtest/apiserver.log /tmp/acp-runner-envtest/etcd.log; do
