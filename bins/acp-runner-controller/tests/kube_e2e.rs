@@ -670,6 +670,8 @@ async fn controller_end_to_end_on_a_real_apiserver() {
             credential_files: Default::default(),
             runner_secret_files: Default::default(),
             timeouts: Default::default(),
+            owner_kind: Default::default(),
+            gateway_port: None,
         };
         let sref = backend.create(&req).await.expect("Sandbox accepted by the v1beta1 schema");
         let obs = backend.observe(&sref).await.unwrap();
@@ -699,4 +701,171 @@ fn base64_url(s: &str) -> String {
         }
     }
     out
+}
+
+/// V10: AgentEnvironment through the controller — create (owner = the resource), gateway
+/// Service + status connection reference, a real ACP turn with a ticket signed by the mounted
+/// master key, `spec.lifecycle: finish` -> final artifact, deletion -> sandbox, Service and
+/// lease gone before the finalizer is removed.
+#[tokio::test]
+async fn agent_environment_through_the_controller() {
+    let Ok(kubeconfig) = std::env::var("ACP_E2E_KUBECONFIG") else {
+        acp_runner_journal::testing::skip_or_fail("ACP_E2E_KUBECONFIG is not set (scripts/envtest-up.sh)");
+        return;
+    };
+    let Some(db) = acp_runner_journal::testing::temp_database().await else { return };
+    build_bins();
+    let client = client_from(&kubeconfig, None).await;
+    apply_yaml_crds(&client, &acp_runner_k8s::crds_yaml()).await;
+    let ns = format!("acp-env-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+    let nss: Api<Namespace> = Api::all(client.clone());
+    nss.create(&PostParams::default(), &serde_json::from_value(json!({"metadata": {"name": ns}})).unwrap())
+        .await
+        .unwrap();
+    let sas: Api<ServiceAccount> = Api::namespaced(client.clone(), &ns);
+    sas.create(
+        &PostParams::default(),
+        &serde_json::from_value(
+            json!({"metadata": {"name": "acp-runner-agent"}, "automountServiceAccountToken": false}),
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let sha = fixture_repo(&tmp.path().join("upstream"));
+    let repo = format!("file://{}", tmp.path().join("upstream").display());
+    let fake = target_dir().join("fake-acp-agent");
+    let _kubelet = FakeKubelet::start(client.clone(), ns.clone(), tmp.path().join("nodes"));
+    let key_file = tmp.path().join("ticket-key");
+    std::fs::write(&key_file, "ab".repeat(32)).unwrap();
+    let gw_port = free_port();
+    let (ingest_port, metrics_port) = (free_port(), free_port());
+    let log = std::fs::File::create(tmp.path().join("controller.log")).unwrap();
+    let mut controller = std::process::Command::new(target_dir().join("acp-runner-controller"))
+        .arg("run")
+        .env_remove("HTTPS_PROXY")
+        .env_remove("https_proxy")
+        .env_remove("HTTP_PROXY")
+        .env_remove("http_proxy")
+        .env("KUBECONFIG", &kubeconfig)
+        .env("DATABASE_URL", &db.url)
+        .env("POD_NAME", "controller-env-e2e")
+        .env("ACP_RUNNER_INGEST_URL", format!("http://127.0.0.1:{ingest_port}"))
+        .env("ACP_RUNNER_INGEST_LISTEN", format!("127.0.0.1:{ingest_port}"))
+        .env("ACP_RUNNER_METRICS_LISTEN", format!("127.0.0.1:{metrics_port}"))
+        .env("ACP_RUNNER_WATCH_NAMESPACE", &ns)
+        .env("ACP_RUNNER_CREDENTIAL_NAMESPACE", &ns)
+        .env("ACP_RUNNER_STRICT_POSTURE", "false")
+        .env("ACP_RUNNER_ALLOW_FILE_REPOS", "true")
+        .env("ACP_RUNNER_TICKET_KEY_FILE", &key_file)
+        .env("ACP_RUNNER_GATEWAY_LISTEN", format!("127.0.0.1:{gw_port}"))
+        .env("RUST_LOG", "info")
+        .stdout(log.try_clone().unwrap())
+        .stderr(log)
+        .spawn()
+        .unwrap();
+    let logs = || std::fs::read_to_string(tmp.path().join("controller.log")).unwrap_or_default();
+
+    let envs: Api<AgentEnvironment> = Api::namespaced(client.clone(), &ns);
+    let ae: AgentEnvironment = serde_json::from_value(json!({
+        "apiVersion": "acp-runner.dev/v1alpha1", "kind": "AgentEnvironment",
+        "metadata": {"name": "dev-1", "namespace": ns},
+        "spec": {
+            "externalRef": "task-env-1",
+            "harness": {"name": "fake", "config": {"command": fake.to_string_lossy()}},
+            "workspace": {"source": {"type": "git", "url": repo, "revision": sha}},
+            "timeouts": {"noProgressSeconds": 600}
+        }
+    }))
+    .unwrap();
+    envs.create(&PostParams::default(), &ae).await.unwrap();
+    let wait = |want: &'static [&'static str], limit: Duration| {
+        let envs = envs.clone();
+        async move {
+            let start = Instant::now();
+            loop {
+                let e = envs.get("dev-1").await.unwrap();
+                if e.status.as_ref().and_then(|s| s.phase.as_deref()).is_some_and(|p| want.contains(&p)) {
+                    return e;
+                }
+                assert!(start.elapsed() < limit, "environment did not reach {want:?}: {:?}", e.status);
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        }
+    };
+    let e = wait(&["Idle", "Failed"], Duration::from_secs(120)).await;
+    let st = e.status.clone().unwrap();
+    assert_eq!(st.phase.as_deref(), Some("Idle"), "{st:?}\n{}", logs());
+    assert!(e.finalizers().iter().any(|f| f == acp_runner_k8s::crds::ENV_FINALIZER));
+    let env_id: uuid::Uuid = st.environment_id.as_deref().unwrap().parse().unwrap();
+    assert_eq!(st.resolved_revision.as_deref(), Some(sha.as_str()));
+    // the pod is owned by the AgentEnvironment and fronted by a gateway Service
+    let pods: Api<Pod> = Api::namespaced(client.clone(), &ns);
+    let pod = pods.list(&ListParams::default()).await.unwrap().items.pop().expect("environment pod");
+    assert_eq!(pod.metadata.owner_references.as_ref().unwrap()[0].kind, "AgentEnvironment");
+    assert_eq!(pod.labels().get("acp-runner.dev/gateway").map(String::as_str), Some("true"));
+    let svc_name = format!("{}-gw", pod.name_any());
+    let services: Api<k8s_openapi::api::core::v1::Service> = Api::namespaced(client.clone(), &ns);
+    let svc = services.get(&svc_name).await.expect("gateway Service");
+    assert_eq!(svc.spec.as_ref().unwrap().ports.as_ref().unwrap()[0].port, gw_port as i32);
+    assert_eq!(
+        st.connection.as_ref().map(|c| c.gateway.clone()),
+        Some(format!("{svc_name}.{ns}.svc:{gw_port}")),
+        "status must reference the Service, never a ticket"
+    );
+    assert!(!serde_json::to_string(&st).unwrap().contains("ticket"));
+
+    // a caller with a ticket from the master key runs a turn (the Service address is not
+    // resolvable here; the simulated pod listens on the host)
+    let key = acp_runner_engine::environment::TicketKey::from_file(&key_file).unwrap();
+    let (ticket, _) = acp_runner_engine::environment::issue_ticket_with(&key, env_id, 300).unwrap();
+    let (mut c, session) =
+        acp_runner_client::connect_session(&format!("127.0.0.1:{gw_port}"), &ticket, acp_runner_client::Transport::Raw)
+            .await
+            .expect("gateway accepts a master-key ticket");
+    let t = c.prompt(&session, "[[fake:touch:env-note.txt]] write a note").await.unwrap();
+    assert_eq!(t.stop_reason, "end_turn");
+    drop(c);
+    // a ticket for another environment is refused
+    let (other, _) = acp_runner_engine::environment::issue_ticket_with(&key, uuid::Uuid::new_v4(), 300).unwrap();
+    assert!(
+        acp_runner_client::connect_session(&format!("127.0.0.1:{gw_port}"), &other, acp_runner_client::Transport::Raw)
+            .await
+            .is_err()
+    );
+
+    // spec.lifecycle: finish -> Completed with the final artifact; sandbox cleaned up
+    envs.patch("dev-1", &PatchParams::default(), &Patch::Merge(json!({"spec": {"lifecycle": "finish"}})))
+        .await
+        .unwrap();
+    let e = wait(&["Completed", "Failed"], Duration::from_secs(90)).await;
+    let st = e.status.clone().unwrap();
+    assert_eq!(st.phase.as_deref(), Some("Completed"), "{st:?}\n{}", logs());
+    assert_eq!(st.lifecycle_requested.as_deref(), Some("finish"));
+    let fin: uuid::Uuid = st.final_artifact_ref.as_ref().expect("finalArtifactRef").artifact_id.parse().unwrap();
+    let journal = Journal::connect(&db.url, 2).await.unwrap();
+    use acp_runner_journal::ArtifactStore;
+    let store = acp_runner_journal::PgArtifactStore::new(journal.clone(), 8 << 20, None);
+    let patch = store.get_content(fin).await.unwrap();
+    assert!(String::from_utf8_lossy(&patch).contains("env-note.txt"));
+    let start = Instant::now();
+    while !pods.list(&ListParams::default()).await.unwrap().items.is_empty()
+        || services.get_opt(&svc_name).await.unwrap().is_some()
+    {
+        assert!(start.elapsed() < Duration::from_secs(60), "sandbox / Service not cleaned up");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+
+    // deletion: the finalizer is removed and the resource disappears
+    envs.delete("dev-1", &DeleteParams::default()).await.unwrap();
+    let start = Instant::now();
+    while envs.get_opt("dev-1").await.unwrap().is_some() {
+        assert!(start.elapsed() < Duration::from_secs(60), "finalizer not removed\n{}", logs());
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    let _ = controller.kill();
+    let _ = controller.wait();
+    let _ = nss.delete(&ns, &DeleteParams::default()).await;
+    db.drop_db().await;
 }

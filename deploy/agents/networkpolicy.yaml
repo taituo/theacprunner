@@ -7,7 +7,9 @@
 #
 # What this guarantees (with a NetworkPolicy-enforcing CNI — kindnet >= kind v0.33, Calico,
 # Cilium, GKE Dataplane V2, ...):
-#   * no ingress to agent pods at all;
+#   * no ingress to agent pods, except the ACP gateway port (7443) of environment pods
+#     (`acp-runner.dev/gateway: "true"`) from namespaces labelled
+#     `acp-runner.dev/gateway-client: "true"` (callers still need a connection ticket);
 #   * egress is always allowed to cluster DNS and the acp-runner ingest API;
 #   * egress.mode: direct  -> additionally TCP 443/80 to any address OUTSIDE the private/
 #     link-local/CGNAT ranges below (no hostname policy: any public endpoint is reachable);
@@ -114,3 +116,21 @@ spec:
           podSelector: {matchLabels: {app.kubernetes.io/name: acp-egress-proxy}}
       ports:
         - {protocol: TCP, port: 3128}
+---
+# AgentEnvironments: callers reach runnerd's ACP gateway (TCP 7443) through the environment's
+# Service. Only from namespaces that are explicitly marked as gateway clients; the connection
+# ticket (HMAC, environment-scoped, short-lived) is still required on every connection.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: acp-agent-gateway-ingress
+  namespace: acp-agents
+spec:
+  podSelector:
+    matchLabels: {app.kubernetes.io/name: acp-runner-agent, acp-runner.dev/gateway: "true"}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector: {matchLabels: {acp-runner.dev/gateway-client: "true"}}
+      ports:
+        - {protocol: TCP, port: 7443}

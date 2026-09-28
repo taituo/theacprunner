@@ -1153,6 +1153,14 @@ impl Journal {
     }
 
     /// The environment backed by `attempt_id`, if any.
+    /// Environments created for a run (an AgentEnvironment resource owns exactly one run).
+    pub async fn environments_for_run(&self, run_id: Uuid) -> Result<Vec<EnvironmentRow>> {
+        Ok(sqlx::query_as("SELECT * FROM environments WHERE run_id = $1 ORDER BY created_at")
+            .bind(run_id)
+            .fetch_all(&self.pool)
+            .await?)
+    }
+
     pub async fn environment_by_attempt(&self, attempt_id: Uuid) -> Result<Option<EnvironmentRow>> {
         Ok(sqlx::query_as("SELECT * FROM environments WHERE attempt_id = $1")
             .bind(attempt_id)

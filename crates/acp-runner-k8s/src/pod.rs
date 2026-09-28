@@ -88,7 +88,7 @@ impl PodConfig {
         }
         Some(vec![OwnerReference {
             api_version: format!("{}/{}", crate::crds::GROUP, crate::crds::VERSION),
-            kind: "ACPRun".into(),
+            kind: req.owner_kind.kind().into(),
             name: req.run_key.name.clone(),
             uid: req.run_key.uid.clone(),
             controller: Some(true),
@@ -101,24 +101,54 @@ pub fn secret_name(req: &SandboxRequest) -> String {
     format!("{}-att", req.name)
 }
 
+/// A valid label value: `[A-Za-z0-9._-]`, at most 63 characters, alphanumeric at both ends
+/// (environment classes are named `env:<harness>`, which is not a label value).
+pub fn label_value(v: &str) -> String {
+    let mut s: String =
+        v.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '-' }).collect();
+    s.truncate(63);
+    s.trim_matches(|c: char| !c.is_ascii_alphanumeric()).to_string()
+}
+
 pub fn labels(req: &SandboxRequest) -> BTreeMap<String, String> {
-    let mut run_name = req.run_key.name.clone();
-    run_name.truncate(63);
+    let run_name = label_value(&req.run_key.name);
     BTreeMap::from([
         ("app.kubernetes.io/name".to_string(), "acp-runner-agent".to_string()),
         ("app.kubernetes.io/managed-by".to_string(), "acp-runner".to_string()),
         ("acp-runner.dev/run-id".to_string(), req.run_id.to_string()),
         ("acp-runner.dev/attempt-id".to_string(), req.attempt_id.to_string()),
-        (
-            "acp-runner.dev/run-name".to_string(),
-            run_name.trim_end_matches(|c: char| !c.is_ascii_alphanumeric()).to_string(),
-        ),
-        ("acp-runner.dev/driver".to_string(), req.class.driver.clone()),
-        ("acp-runner.dev/runner-class".to_string(), req.class.name.clone()),
+        ("acp-runner.dev/run-name".to_string(), run_name),
+        ("acp-runner.dev/driver".to_string(), label_value(&req.class.driver)),
+        ("acp-runner.dev/runner-class".to_string(), label_value(&req.class.name)),
         ("acp-runner.dev/ordinal".to_string(), req.ordinal.to_string()),
         // selects the NetworkPolicy set (deploy/agents/networkpolicy.yaml)
         ("acp-runner.dev/egress".to_string(), req.class.egress.effective_mode().as_str().to_string()),
+        // environments: the gateway NetworkPolicy admits callers to this pod's gateway port
+        ("acp-runner.dev/gateway".to_string(), req.gateway_port.is_some().to_string()),
     ])
+}
+
+/// The Service in front of an environment's ACP gateway (`<sandbox>-gw`).
+pub fn gateway_service_name(sandbox: &str) -> String {
+    format!("{sandbox}-gw")
+}
+
+/// ClusterIP Service selecting exactly this attempt's pod, port = the gateway port. Who may
+/// connect is decided by the gateway NetworkPolicy and, above all, the connection ticket.
+pub fn build_gateway_service(req: &SandboxRequest, cfg: &PodConfig) -> Option<k8s_openapi::api::core::v1::Service> {
+    let port = req.gateway_port?;
+    let selector = BTreeMap::from([("acp-runner.dev/attempt-id".to_string(), req.attempt_id.to_string())]);
+    Some(
+        serde_json::from_value(json!({
+            "metadata": meta(req, cfg, gateway_service_name(&req.name)),
+            "spec": {
+                "type": "ClusterIP",
+                "selector": selector,
+                "ports": [{"name": "acp-gateway", "port": port, "targetPort": port, "protocol": "TCP"}]
+            }
+        }))
+        .expect("service json"),
+    )
 }
 
 fn meta(req: &SandboxRequest, cfg: &PodConfig, name: String) -> ObjectMeta {
@@ -216,6 +246,9 @@ pub fn pod_spec_json(req: &SandboxRequest, cfg: &PodConfig) -> Value {
         "resources": cfg.runnerd_resources,
         "terminationMessagePolicy": "FallbackToLogsOnError"
     });
+    if let Some(port) = req.gateway_port {
+        runnerd["ports"] = json!([{"name": "acp-gateway", "containerPort": port, "protocol": "TCP"}]);
+    }
     let mut agentd = json!({
         "name": AGENTD_CONTAINER,
         "image": c.image,
@@ -326,6 +359,8 @@ pub(crate) mod tests {
             credential_files: BTreeMap::from([("auth.json".to_string(), b"{\"secret\":1}".to_vec())]),
             runner_secret_files: Default::default(),
             timeouts: TimeoutPolicy::default(),
+            owner_kind: Default::default(),
+            gateway_port: None,
         }
     }
 
@@ -414,6 +449,31 @@ pub(crate) mod tests {
         assert_eq!(labels(&req)["acp-runner.dev/egress"], "proxy");
         let pod = serde_json::to_value(build_pod(&req, &PodConfig::default())).unwrap();
         assert_eq!(pod["metadata"]["labels"]["acp-runner.dev/egress"], "proxy");
+    }
+
+    #[test]
+    fn environments_get_a_gateway_service_and_their_owner_kind() {
+        let mut req = request(None);
+        assert!(build_gateway_service(&req, &PodConfig::default()).is_none());
+        req.gateway_port = Some(7443);
+        req.owner_kind = acp_runner_engine::backend::OwnerKind::Environment;
+        let svc = serde_json::to_value(build_gateway_service(&req, &PodConfig::default()).unwrap()).unwrap();
+        assert_eq!(svc["metadata"]["name"], "acp-fix-bug-a1-00000000-gw");
+        assert_eq!(svc["spec"]["ports"][0]["port"], 7443);
+        assert_eq!(svc["spec"]["selector"]["acp-runner.dev/attempt-id"], Uuid::nil().to_string());
+        assert_eq!(svc["metadata"]["ownerReferences"][0]["kind"], "AgentEnvironment");
+        let pod = serde_json::to_value(build_pod(&req, &PodConfig::default())).unwrap();
+        assert_eq!(pod["metadata"]["labels"]["acp-runner.dev/gateway"], "true");
+        let runnerd = container(&pod["spec"], RUNNERD_CONTAINER);
+        assert_eq!(runnerd["ports"][0]["containerPort"], 7443);
+        assert!(container(&pod["spec"], AGENTD_CONTAINER).get("ports").is_none());
+    }
+
+    #[test]
+    fn label_values_are_valid() {
+        assert_eq!(label_value("env:fake"), "env-fake");
+        assert_eq!(label_value("-x-"), "x");
+        assert_eq!(label_value(&"a".repeat(80)).len(), 63);
     }
 
     #[test]

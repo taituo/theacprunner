@@ -37,3 +37,4 @@ uuid.workspace = true
 tempfile.workspace = true
 acp-runner-engine = { workspace = true, features = ["test-support"] }
 nix.workspace = true
+acp-runner-client.workspace = true

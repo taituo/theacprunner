@@ -12,11 +12,13 @@
 mod common;
 
 use acp_runner_client::{AcpClient, ClientError, Transport, connect_session};
+use acp_runner_core::attempt_spec::SessionMode;
 use acp_runner_core::environment::EnvironmentPhase;
 use acp_runner_core::events::RunnerDirective;
 use acp_runner_core::ticket;
 use common::env_mode::*;
 use common::*;
+use runnerd::sink::MemorySink;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -169,4 +171,28 @@ async fn claude_code_multi_turn_through_the_acp_bridge() {
     for s in env.secrets() {
         assert!(!text.contains(&s), "Claude token leaked into events");
     }
+}
+
+/// V10: when the controller stays unreachable, runnerd stops the harness on its own before
+/// the (unrenewed) credential lease could lapse.
+#[tokio::test]
+async fn harness_is_stopped_when_the_controller_stays_unreachable() {
+    let env = TestEnv::new(&Target::fake_acp()).await;
+    let sink = MemorySink::default();
+    let fail = sink.fail_heartbeats.clone();
+    let r = Running::start_with_sink(
+        &env,
+        |s| {
+            if let SessionMode::Environment { controller_loss_stop_seconds, .. } = &mut s.session {
+                *controller_loss_stop_seconds = Some(2);
+            }
+        },
+        sink,
+    )
+    .await;
+    fail.store(true, std::sync::atomic::Ordering::SeqCst);
+    let started = std::time::Instant::now();
+    let (res, _) = r.result().await;
+    assert!(started.elapsed() < std::time::Duration::from_secs(30));
+    assert!(serde_json::to_string(&res.reason).unwrap().contains("controller unreachable"), "{res:?}");
 }

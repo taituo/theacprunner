@@ -845,6 +845,8 @@ impl Engine {
             credential_files,
             runner_secret_files: Default::default(),
             timeouts: spec.effective_timeouts(class),
+            owner_kind: Default::default(),
+            gateway_port: None,
         };
         match self.backend.create(&req).await {
             Ok(sref) => {

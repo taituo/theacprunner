@@ -7,10 +7,13 @@
 //!   `shutdownTime` is set as an extra expiry backstop. Warm pools / claims are not used:
 //!   an attempt's pod needs its per-attempt credential Secret at creation time.
 
-use crate::pod::{PodConfig, RUNNERD_CONTAINER, build_pod, build_secret, labels, pod_spec_json, secret_name};
+use crate::pod::{
+    PodConfig, RUNNERD_CONTAINER, build_gateway_service, build_pod, build_secret, gateway_service_name, labels,
+    pod_spec_json, secret_name,
+};
 use acp_runner_engine::backend::{BackendError, SandboxBackend, SandboxObservation, SandboxRef, SandboxRequest};
 use async_trait::async_trait;
-use k8s_openapi::api::core::v1::{Pod, Secret};
+use k8s_openapi::api::core::v1::{Pod, Secret, Service};
 use kube::Client;
 use kube::api::{Api, DeleteParams, DynamicObject, PostParams, PropagationPolicy};
 use kube::core::{ApiResource, GroupVersionKind};
@@ -76,6 +79,33 @@ const FATAL_WAITING: &[&str] = &[
 /// Map a pod to an observation. The attempt's liveness is runnerd's: when the runnerd
 /// container has terminated the sandbox counts as exited even if agentd is still running
 /// (the engine then deletes the pod).
+async fn create_gateway_service(
+    client: &Client,
+    ns: &str,
+    req: &SandboxRequest,
+    cfg: &PodConfig,
+) -> Result<(), BackendError> {
+    let Some(svc) = build_gateway_service(req, cfg) else { return Ok(()) };
+    let api: Api<Service> = Api::namespaced(client.clone(), ns);
+    delete_ignore_missing(&api, &gateway_service_name(&req.name), None).await?;
+    wait_gone(&api, &gateway_service_name(&req.name), Duration::from_secs(10)).await?;
+    api.create(&PostParams::default(), &svc).await.map_err(err)?;
+    Ok(())
+}
+
+async fn delete_gateway_service(client: &Client, ns: &str, sandbox: &str) -> Result<(), BackendError> {
+    let api: Api<Service> = Api::namespaced(client.clone(), ns);
+    delete_ignore_missing(&api, &gateway_service_name(sandbox), None).await
+}
+
+/// `<sandbox>-gw.<ns>.svc:<port>` (port as runnerd bound it).
+fn service_endpoint(r: &SandboxRef, reported: &str) -> String {
+    match (r.namespace.as_deref(), reported.rsplit_once(':')) {
+        (Some(ns), Some((_, port))) => format!("{}.{ns}.svc:{port}", gateway_service_name(&r.name)),
+        _ => reported.to_string(),
+    }
+}
+
 pub fn classify_pod(p: &Pod) -> SandboxObservation {
     let Some(status) = &p.status else { return SandboxObservation::Pending { reason: None } };
     let statuses = status.container_statuses.clone().unwrap_or_default();
@@ -139,6 +169,7 @@ impl SandboxBackend for PodBackend {
         wait_gone(&secrets, &secret_name(req), Duration::from_secs(10)).await?;
         secrets.create(&PostParams::default(), &build_secret(req, &self.cfg)).await.map_err(err)?;
         pods.create(&PostParams::default(), &build_pod(req, &self.cfg)).await.map_err(err)?;
+        create_gateway_service(&self.client, &ns, req, &self.cfg).await?;
         Ok(SandboxRef { backend: "pod".into(), namespace: Some(ns), name: req.name.clone() })
     }
 
@@ -155,7 +186,12 @@ impl SandboxBackend for PodBackend {
         let pods: Api<Pod> = Api::namespaced(self.client.clone(), ns);
         let secrets: Api<Secret> = Api::namespaced(self.client.clone(), ns);
         delete_ignore_missing(&pods, &r.name, Some(grace.as_secs() as u32)).await?;
+        delete_gateway_service(&self.client, ns, &r.name).await?;
         delete_ignore_missing(&secrets, &format!("{}-att", r.name), None).await
+    }
+
+    fn gateway_endpoint(&self, r: &SandboxRef, reported: &str) -> String {
+        service_endpoint(r, reported)
     }
 }
 
@@ -222,6 +258,7 @@ impl SandboxBackend for AgentSandboxBackend {
         let obj: DynamicObject = serde_json::from_value(Self::build_sandbox(req, &self.cfg))
             .map_err(|e| BackendError::Permanent(e.to_string()))?;
         api.create(&PostParams::default(), &obj).await.map_err(err)?;
+        create_gateway_service(&self.client, &ns, req, &self.cfg).await?;
         Ok(SandboxRef { backend: "agent-sandbox".into(), namespace: Some(ns), name: req.name.clone() })
     }
 
@@ -271,8 +308,13 @@ impl SandboxBackend for AgentSandboxBackend {
         // The pod template carries terminationGracePeriodSeconds = grace + 15.
         let ns = r.namespace.as_deref().unwrap_or("default");
         delete_ignore_missing(&self.api(ns), &r.name, None).await?;
+        delete_gateway_service(&self.client, ns, &r.name).await?;
         let secrets: Api<Secret> = Api::namespaced(self.client.clone(), ns);
         delete_ignore_missing(&secrets, &format!("{}-att", r.name), None).await
+    }
+
+    fn gateway_endpoint(&self, r: &SandboxRef, reported: &str) -> String {
+        service_endpoint(r, reported)
     }
 }
 

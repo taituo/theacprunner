@@ -518,6 +518,21 @@ finalizer: attempts are cancelled, sandboxes terminated, leases released; the jo
 and a Role for Secrets in `acp-runner-system` (credential store). The agent service account
 `acp-runner-agent` has no bindings and no token.
 
+**AgentEnvironment controller.** Enabled when `ACP_RUNNER_TICKET_KEY_FILE` points at the
+connection-ticket master key (a Secret, `openssl rand -hex 32`; stable across restarts and
+shared by replicas). Per resource: the provider creates exactly one environment (owner =
+the resource; idempotent under a run lock), the pod carries an owner reference to the
+AgentEnvironment and runnerd's gateway port, and a ClusterIP Service `<sandbox>-gw` fronts it;
+`status.connection.gateway` is that Service address (never a ticket). Callers get a ticket
+from the provider or from an administrator (`acp-runnerctl env ticket <environmentId>
+--ticket-key-file ...`); the NetworkPolicy `acp-agent-gateway-ingress` admits only
+namespaces labelled `acp-runner.dev/gateway-client=true`. `spec.lifecycle: finish|cancel`
+is acted on once (`status.lifecycleRequested`). A silent runnerd fails the environment
+(`HeartbeatLost`/`StartTimeout`); runnerd in turn stops the harness when it cannot reach the
+controller for the credential lease window minus 60 s. The credential lease is released only
+after the backend reports the sandbox gone (fencing), and deletion keeps the finalizer until
+then. Verified on envtest with the simulated kubelet (`kube_e2e::agent_environment_through_the_controller`).
+
 **Controller replicas.** Safe to run more than one: every reconcile holds a
 transaction-scoped PostgreSQL advisory lock on the run; attempts carry a supervision lease
 (`lease_owner`, `lease_expires_at`, 45 s) — an instance that finds another live owner backs

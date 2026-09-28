@@ -135,8 +135,13 @@ pub async fn run_environment(
     opts: SupervisorOptions,
     mut external_cancel: watch::Receiver<bool>,
 ) -> EnvironmentResult {
-    let SessionMode::Environment { environment_id, gateway_listen, idle_timeout_seconds, max_lifetime_seconds } =
-        spec.session.clone()
+    let SessionMode::Environment {
+        environment_id,
+        gateway_listen,
+        idle_timeout_seconds,
+        max_lifetime_seconds,
+        controller_loss_stop_seconds,
+    } = spec.session.clone()
     else {
         return bad(FailureReason::Internal { detail: "run_environment called for a one-shot attempt".into() });
     };
@@ -518,6 +523,8 @@ pub async fn run_environment(
         handled_directives: std::collections::HashSet::new(),
     };
     let idle_timeout = idle_timeout_seconds.map(Duration::from_secs);
+    let controller_loss_stop = controller_loss_stop_seconds.map(Duration::from_secs);
+    let mut last_heartbeat_ok = Instant::now();
     let max_lifetime = max_lifetime_seconds.map(Duration::from_secs);
     let mut hb = tokio::time::interval(hb_every);
     let mut tick = tokio::time::interval(Duration::from_millis(250));
@@ -571,7 +578,24 @@ pub async fn run_environment(
                 let hb = HeartbeatData { agent_alive: state.agent_open, agent_pid: None, seconds_since_progress: None, stage: state.phase.as_str().to_string() };
                 // Provider operations (snapshot/finish/cancel) arrive on the heartbeat reply
                 // (controller -> runnerd); they never travel on the ACP dataplane.
-                let reply = em.sink.heartbeat(&hb).await.unwrap_or_default();
+                let reply = match em.sink.heartbeat(&hb).await {
+                    Ok(r) => {
+                        last_heartbeat_ok = Instant::now();
+                        r
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "heartbeat failed");
+                        if let Some(limit) = controller_loss_stop
+                            && last_heartbeat_ok.elapsed() > limit
+                        {
+                            break Finish::Cancel(format!(
+                                "controller unreachable for {}s; stopping the harness before its credential lease can lapse",
+                                last_heartbeat_ok.elapsed().as_secs()
+                            ));
+                        }
+                        Default::default()
+                    }
+                };
                 if let Some(directive) = reply.directive {
                     // Durable directives are redelivered until acknowledged; handle each once.
                     if let Some(id) = reply.directive_id {

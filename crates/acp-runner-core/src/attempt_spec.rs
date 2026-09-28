@@ -75,6 +75,11 @@ pub enum SessionMode {
         /// Destroy the environment after this long regardless of activity.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_lifetime_seconds: Option<u64>,
+        /// Fail-safe: stop the harness after the controller has been unreachable (no
+        /// successful heartbeat) this long — set below the credential lease window, so the
+        /// agent is gone before a lapsed lease could be granted to someone else.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        controller_loss_stop_seconds: Option<u64>,
     },
 }
 

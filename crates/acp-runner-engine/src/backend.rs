@@ -46,6 +46,26 @@ pub struct SandboxRequest {
     /// `gateway-key`). Never visible to the agent.
     pub runner_secret_files: BTreeMap<String, Vec<u8>>,
     pub timeouts: TimeoutPolicy,
+    /// Which resource owns the sandbox (`run_key` names it): owner references and cleanup.
+    pub owner_kind: OwnerKind,
+    /// Environment mode: runnerd's ACP gateway port, exposed by the backend (pod: a Service).
+    pub gateway_port: Option<u16>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OwnerKind {
+    #[default]
+    Run,
+    Environment,
+}
+
+impl OwnerKind {
+    pub fn kind(self) -> &'static str {
+        match self {
+            OwnerKind::Run => "ACPRun",
+            OwnerKind::Environment => "AgentEnvironment",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,6 +102,11 @@ pub trait SandboxBackend: Send + Sync {
     async fn observe(&self, r: &SandboxRef) -> Result<SandboxObservation, BackendError>;
     /// Terminate with a bounded grace period (SIGTERM, then SIGKILL). Idempotent.
     async fn terminate(&self, r: &SandboxRef, grace: Duration) -> Result<(), BackendError>;
+    /// Where callers reach an environment's gateway, given the address runnerd reported
+    /// (`host:port` as bound inside the sandbox). Default: the reported address (local).
+    fn gateway_endpoint(&self, _r: &SandboxRef, reported: &str) -> String {
+        reported.to_string()
+    }
 }
 
 /// DNS-1123 label derived from run name, ordinal and attempt id.

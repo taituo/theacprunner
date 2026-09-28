@@ -57,6 +57,7 @@ pub fn env_spec(env: &TestEnv, environment_id: Uuid) -> AttemptSpec {
             gateway_listen: "127.0.0.1:0".into(),
             idle_timeout_seconds: None,
             max_lifetime_seconds: None,
+            controller_loss_stop_seconds: None,
         },
         bootstrap: Default::default(),
         home_files: vec![],

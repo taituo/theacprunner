@@ -83,6 +83,7 @@ dependencies = [
 name = "acp-runner-controller"
 version = "0.1.0"
 dependencies = [
+ "acp-runner-client",
  "acp-runner-core",
  "acp-runner-engine",
  "acp-runner-journal",

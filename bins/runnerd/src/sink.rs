@@ -377,6 +377,8 @@ pub struct MemorySink {
     pub overlays: Arc<Mutex<std::collections::HashMap<Uuid, Vec<u8>>>>,
     pub bundles: Arc<Mutex<std::collections::HashMap<String, Bundle>>>,
     pub harnesses: Arc<Mutex<std::collections::HashMap<String, PathBuf>>>,
+    /// Tests: make heartbeats fail (controller unreachable).
+    pub fail_heartbeats: Arc<std::sync::atomic::AtomicBool>,
     seq: u64,
 }
 
@@ -394,6 +396,9 @@ impl EventSink for MemorySink {
         self.record.lock().expect("lock").events.push(ev);
     }
     async fn heartbeat(&mut self, hb: &HeartbeatData) -> Result<HeartbeatReply, SinkError> {
+        if self.fail_heartbeats.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(SinkError::Io("controller unreachable (test)".into()));
+        }
         self.record.lock().expect("lock").heartbeats.push(hb.clone());
         let directive = self.directives.lock().expect("lock").pop_front();
         let directive_id = directive.as_ref().map(|_| uuid::Uuid::now_v7());

@@ -19,6 +19,8 @@ use std::collections::BTreeMap;
 pub const GROUP: &str = "acp-runner.dev";
 pub const VERSION: &str = "v1alpha1";
 pub const FINALIZER: &str = "acp-runner.dev/run-cleanup";
+/// Finalizer on AgentEnvironment: sandbox terminated and lease released before deletion.
+pub const ENV_FINALIZER: &str = "acp-runner.dev/environment-cleanup";
 
 fn preserve_unknown_opt(g: &mut schemars::SchemaGenerator) -> schemars::Schema {
     preserve_unknown(g)
@@ -703,7 +705,7 @@ pub struct EnvCredentials {
     pub profile: String,
 }
 
-#[derive(Deserialize, Serialize, Clone, Debug, JsonSchema, Default)]
+#[derive(Deserialize, Serialize, Clone, Debug, JsonSchema, Default, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentEnvironmentStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -734,6 +736,11 @@ pub struct AgentEnvironmentStatus {
     pub failure_reason: Option<FailureStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_generation: Option<i64>,
+    /// `spec.lifecycle` value the controller has already acted on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle_requested: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, JsonSchema, PartialEq)]

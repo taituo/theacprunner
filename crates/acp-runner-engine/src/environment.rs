@@ -14,7 +14,7 @@
 //! The caller never sees Kubernetes objects, PostgreSQL, the ingest token or provider
 //! credentials.
 
-use crate::backend::{RunKey, SandboxBackend, SandboxRequest, sandbox_name};
+use crate::backend::{OwnerKind, RunKey, SandboxBackend, SandboxObservation, SandboxRequest, sandbox_name};
 use crate::bundles::BundleProvider;
 use crate::creds::CredentialStore;
 use crate::harness::HarnessProvider;
@@ -104,6 +104,15 @@ impl std::fmt::Debug for TicketKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("TicketKey(<redacted>)")
     }
+}
+
+/// Issue a connection ticket for `env_id` with the provider master key (what the provider,
+/// or an administrator holding the key Secret, hands to a caller). Returns (ticket, exp).
+pub fn issue_ticket_with(key: &TicketKey, env_id: Uuid, ttl_seconds: i64) -> Result<(String, i64)> {
+    let env_key = ticket::derive_env_key(key.bytes(), env_id).map_err(|e| anyhow::anyhow!("ticket key: {e}"))?;
+    let claims = ticket::claims_for(env_id, chrono::Utc::now().timestamp(), ttl_seconds);
+    let exp = claims.exp;
+    Ok((ticket::issue(&env_key, &claims), exp))
 }
 
 /// A random master key (tests / single-process development; not restart-safe).
@@ -257,10 +266,7 @@ impl EnvironmentProvider {
 
     /// Issue a fresh connection ticket for a live environment (no provider state involved).
     pub fn issue_ticket(&self, env_id: Uuid) -> Result<(String, i64)> {
-        let now = chrono::Utc::now().timestamp();
-        let claims = ticket::claims_for(env_id, now, self.cfg.ticket_ttl_seconds);
-        let exp = claims.exp;
-        Ok((ticket::issue(&self.env_key(env_id)?, &claims), exp))
+        issue_ticket_with(&self.cfg.ticket_key, env_id, self.cfg.ticket_ttl_seconds)
     }
 
     fn runner_class(&self, spec: &EnvironmentSpec, driver: &str) -> acp_runner_core::spec::RunnerClassSpec {
@@ -539,6 +545,19 @@ impl EnvironmentProvider {
                 spec: serde_json::to_value(&stored)?,
             })
             .await?;
+        // An owning resource (AgentEnvironment) gets exactly one environment, even when the
+        // status update after a create was lost or two controller replicas race.
+        let _owner_lock = if owner.is_some() {
+            let Some(lock) = self.journal.try_lock_run(run.id).await? else {
+                anyhow::bail!("another controller instance is creating this environment");
+            };
+            if let Some(existing) = self.journal.environments_for_run(run.id).await?.into_iter().next() {
+                return self.view_from(existing).await;
+            }
+            Some(lock)
+        } else {
+            None
+        };
         let empty_source = ws.source.is_none();
         let plan = BootstrapPlan {
             workdir: workdir.clone(),
@@ -596,6 +615,9 @@ impl EnvironmentProvider {
                 gateway_listen: self.cfg.gateway_listen.clone(),
                 idle_timeout_seconds: spec.idle_seconds(),
                 max_lifetime_seconds: spec.lifetime.max_seconds,
+                controller_loss_stop_seconds: Some(
+                    self.cfg.credential_lease_window.as_secs().saturating_sub(CONTROLLER_LOSS_MARGIN_SECONDS).max(30),
+                ),
             },
             bootstrap: plan,
             home_files,
@@ -673,7 +695,7 @@ impl EnvironmentProvider {
                 Err(e) => {
                     let reason = FailureReason::CredentialUnavailable { detail: format!("{profile}: {e}") };
                     self.journal.set_environment_phase(env_id, "Failed", Some(&reason)).await?;
-                    self.finalize(&env_row).await;
+                    let _ = self.finalize(&env_row).await;
                     anyhow::bail!("loading credential profile {profile}: {e}");
                 }
             }
@@ -697,13 +719,15 @@ impl EnvironmentProvider {
                 hex::encode(gateway_key).into_bytes(),
             )]),
             timeouts: t,
+            owner_kind: if owner.is_some() { OwnerKind::Environment } else { OwnerKind::Run },
+            gateway_port: gateway_port(&self.cfg.gateway_listen),
         };
         match self.backend.create(&req).await {
             Ok(sref) => self.journal.set_attempt_sandbox(attempt_id, &serde_json::to_value(&sref)?).await?,
             Err(e) => {
                 let reason = FailureReason::SandboxFailed { detail: e.to_string() };
                 self.journal.set_environment_phase(env_id, "Failed", Some(&reason)).await?;
-                self.finalize(&env_row).await;
+                let _ = self.finalize(&env_row).await;
                 anyhow::bail!("creating the environment sandbox: {e}");
             }
         }
@@ -746,25 +770,85 @@ impl EnvironmentProvider {
 
     /// Release what an ended environment holds: sandbox and credential lease (after the
     /// validated write-back, which runnerd performs before reporting the terminal state).
-    async fn finalize(&self, env: &acp_runner_journal::EnvironmentRow) {
-        if let Ok(a) = self.journal.get_attempt(env.attempt_id).await
-            && a.sandbox_released_at.is_none()
-            && let Some(sref) = a.sandbox_ref.clone()
-            && let Ok(sref) = serde_json::from_value(sref)
-        {
-            let _ = self.backend.terminate(&sref, Duration::from_secs(env_terminate_grace())).await;
-            let _ = self.journal.mark_sandbox_released(env.attempt_id).await;
+    /// Terminate the sandbox, then release the credential lease — the lease only once the
+    /// backend reports the sandbox gone or exited (fencing: an exclusive credential never has
+    /// two live holders). Returns false while the sandbox is still terminating; callers
+    /// (the controller's reconcile, the next refresh) call it again.
+    async fn finalize(&self, env: &acp_runner_journal::EnvironmentRow) -> bool {
+        let Ok(a) = self.journal.get_attempt(env.attempt_id).await else { return false };
+        if a.sandbox_released_at.is_none() {
+            match a.sandbox_ref.clone().and_then(|v| serde_json::from_value::<crate::backend::SandboxRef>(v).ok()) {
+                Some(sref) => {
+                    let _ = self.backend.terminate(&sref, Duration::from_secs(env_terminate_grace())).await;
+                    match self.backend.observe(&sref).await {
+                        Ok(SandboxObservation::Missing) | Ok(SandboxObservation::Exited { .. }) => {
+                            let _ = self.journal.mark_sandbox_released(env.attempt_id).await;
+                        }
+                        _ => return false,
+                    }
+                }
+                None => {
+                    let _ = self.journal.mark_sandbox_released(env.attempt_id).await;
+                }
+            }
         }
         if let Ok(true) = self.journal.release_lease(env.attempt_id).await {
             tracing::debug!(environment_id = %env.id, "credential lease released");
         }
+        true
+    }
+
+    /// Controller hook: bring a terminal environment's resources down. `Ok(true)` when the
+    /// sandbox is gone and the lease released (or the environment is unknown).
+    pub async fn cleanup(&self, env_id: Uuid) -> Result<bool> {
+        let Some(env) = self.journal.get_environment(env_id).await? else { return Ok(true) };
+        if !env.phase().is_terminal() {
+            return Ok(false);
+        }
+        Ok(self.finalize(&env).await)
+    }
+
+    /// End an environment now (resource deleted): mark it failed/cancelled if it is still
+    /// live, terminate the sandbox, release the lease once it is gone. `Ok(true)` when done.
+    pub async fn force_end(&self, env_id: Uuid, reason: &str) -> Result<bool> {
+        let Some(env) = self.journal.get_environment(env_id).await? else { return Ok(true) };
+        if !env.phase().is_terminal() {
+            let reason = FailureReason::Cancelled { detail: reason.into() };
+            self.journal.set_environment_phase(env_id, "Failed", Some(&reason)).await?;
+            let _ = self
+                .journal
+                .transition_attempt(
+                    env.attempt_id,
+                    &acp_runner_core::AttemptPhase::ACTIVE,
+                    acp_runner_core::AttemptPhase::Cancelled,
+                    Some(&reason),
+                    None,
+                )
+                .await;
+        }
+        Ok(self.finalize(&env).await)
+    }
+
+    /// Request `finish`/`cancel` without waiting (controller: `spec.lifecycle`).
+    pub async fn request_end(&self, env_id: Uuid, finish: bool, reason: &str) -> Result<()> {
+        let env = self.journal.get_environment(env_id).await?.ok_or_else(|| anyhow::anyhow!("unknown environment"))?;
+        if env.phase().is_terminal() {
+            return Ok(());
+        }
+        let d = if finish {
+            RunnerDirective::Finish
+        } else {
+            RunnerDirective::Cancel { reason: FailureReason::Cancelled { detail: reason.into() } }
+        };
+        self.journal.enqueue_directive(env.attempt_id, &serde_json::to_value(&d)?).await?;
+        Ok(())
     }
 
     /// Derive the environment phase from the journal (events) and persist it.
     async fn refresh(&self, env_id: Uuid) -> Result<()> {
         let Some(env) = self.journal.get_environment(env_id).await? else { return Ok(()) };
         if env.phase().is_terminal() {
-            self.finalize(&env).await;
+            let _ = self.finalize(&env).await;
             return Ok(());
         }
         // Only runnerd-sourced events are consulted (agents cannot emit these categories, and
@@ -776,12 +860,20 @@ impl EnvironmentProvider {
                 &["gateway_listening", "workspace_ready", "environment_ready", "environment_busy", "turn_ended"],
             )
             .await?;
-        // connection ref: from the gateway_listening event.
+        let attempt = self.journal.get_attempt(env.attempt_id).await?;
+        let sref =
+            attempt.sandbox_ref.clone().and_then(|v| serde_json::from_value::<crate::backend::SandboxRef>(v).ok());
+        // connection ref: from the gateway_listening event, as the backend exposes it
+        // (pod: the environment's Service).
         if env.connection_ref.is_none()
             && let Some(addr) = progress.iter().find_map(|e| gateway_addr(&e.data))
         {
             let base = progress.iter().find_map(|e| base_revision(&e.data));
-            self.journal.set_environment_connection(env_id, &json!({"gateway": addr}), base.as_deref()).await?;
+            let endpoint = match &sref {
+                Some(r) => self.backend.gateway_endpoint(r, &addr),
+                None => addr,
+            };
+            self.journal.set_environment_connection(env_id, &json!({"gateway": endpoint}), base.as_deref()).await?;
         }
         // terminal?
         if let Some(term) = self.journal.latest_terminal_event(env.attempt_id).await? {
@@ -809,7 +901,24 @@ impl EnvironmentProvider {
                     None,
                 )
                 .await;
-            self.finalize(&env).await;
+            let _ = self.finalize(&env).await;
+            return Ok(());
+        }
+        // runnerd silent: the environment is lost (heartbeat) or never came up (startup).
+        if let Some(reason) = heartbeat_verdict(&attempt) {
+            tracing::warn!(environment_id = %env_id, reason = %reason, "environment lost");
+            self.journal.set_environment_phase(env_id, "Failed", Some(&reason)).await?;
+            let _ = self
+                .journal
+                .transition_attempt(
+                    env.attempt_id,
+                    &acp_runner_core::AttemptPhase::ACTIVE,
+                    acp_runner_core::AttemptPhase::Failed,
+                    Some(&reason),
+                    None,
+                )
+                .await;
+            let _ = self.finalize(&env).await;
             return Ok(());
         }
         // live phase from the last relevant progress event.
@@ -964,7 +1073,7 @@ impl EnvironmentProvider {
             let reason = FailureReason::Cancelled { detail: "destroyed".into() };
             self.journal.set_environment_phase(env_id, "Failed", Some(&reason)).await?;
         }
-        self.finalize(&env).await;
+        let _ = self.finalize(&env).await;
         Ok(())
     }
 
@@ -979,7 +1088,7 @@ impl EnvironmentProvider {
             let env =
                 self.journal.get_environment(env_id).await?.ok_or_else(|| anyhow::anyhow!("unknown environment"))?;
             if env.phase().is_terminal() {
-                self.finalize(&env).await;
+                let _ = self.finalize(&env).await;
                 return self.view_from(env).await;
             }
             if Instant::now() >= deadline {
@@ -996,6 +1105,32 @@ impl EnvironmentProvider {
         self.artifacts.get_meta(id).await.map(|m| m.attempt_id == attempt_id).unwrap_or(false)
     }
 }
+
+/// Heartbeat loss / start timeout of an environment's runnerd (same rules as one-shot
+/// attempts: `TimeoutPolicy::heartbeat_timeout_seconds`, `startup_seconds`).
+fn heartbeat_verdict(a: &acp_runner_journal::AttemptRow) -> Option<FailureReason> {
+    let t: acp_runner_core::spec::TimeoutPolicy =
+        serde_json::from_value(a.spec.get("timeouts").cloned().unwrap_or_default()).ok()?;
+    let now = chrono::Utc::now();
+    let since = |at: chrono::DateTime<chrono::Utc>| (now - at).num_seconds().max(0) as u64;
+    match a.last_heartbeat_at {
+        None if since(a.created_at) > t.startup_seconds + t.grace_seconds + 60 => {
+            Some(FailureReason::StartTimeout { seconds: t.startup_seconds })
+        }
+        Some(hb) if since(hb) > t.heartbeat_timeout_seconds() => {
+            Some(FailureReason::HeartbeatLost { seconds_since_last: since(hb) })
+        }
+        _ => None,
+    }
+}
+
+/// The port part of `gateway_listen` when it is fixed (a Service can expose it).
+fn gateway_port(listen: &str) -> Option<u16> {
+    listen.rsplit_once(':').and_then(|(_, p)| p.parse().ok()).filter(|p| *p != 0)
+}
+
+/// runnerd stops the harness this long before an unrenewed credential lease would lapse.
+const CONTROLLER_LOSS_MARGIN_SECONDS: u64 = 60;
 
 fn env_terminate_grace() -> u64 {
     20

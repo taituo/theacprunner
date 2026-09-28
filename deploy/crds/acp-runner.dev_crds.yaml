@@ -1002,6 +1002,10 @@ spec:
                 required:
                 - artifactId
                 type: object
+              lifecycleRequested:
+                description: '`spec.lifecycle` value the controller has already acted on.'
+                nullable: true
+                type: string
               lineage:
                 nullable: true
                 properties:
@@ -1012,6 +1016,9 @@ spec:
                     nullable: true
                     type: string
                 type: object
+              message:
+                nullable: true
+                type: string
               observedGeneration:
                 format: int64
                 nullable: true

@@ -39,6 +39,16 @@ spec:
               valueFrom: {fieldRef: {fieldPath: metadata.name}}
             - name: RUST_LOG
               value: info,kube=warn,sqlx=warn
+            # AgentEnvironments: connection-ticket master key (stable across restarts and
+            # shared by replicas). Create once:
+            #   kubectl -n acp-runner-system create secret generic acp-runner-ticket-key \
+            #     --from-literal=key=$(openssl rand -hex 32)
+            - name: ACP_RUNNER_TICKET_KEY_FILE
+              value: /var/run/acp-runner/ticket-key/key
+            - name: ACP_RUNNER_GATEWAY_LISTEN
+              value: 0.0.0.0:7443
+          volumeMounts:
+            - {name: ticket-key, mountPath: /var/run/acp-runner/ticket-key, readOnly: true}
           ports:
             - {name: metrics, containerPort: 8080}
             - {name: ingest, containerPort: 8081}
@@ -55,6 +65,9 @@ spec:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities: {drop: ["ALL"]}
+      volumes:
+        - name: ticket-key
+          secret: {secretName: acp-runner-ticket-key, defaultMode: 0400, optional: true}
 ---
 apiVersion: v1
 kind: Service

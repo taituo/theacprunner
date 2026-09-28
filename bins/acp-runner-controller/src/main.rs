@@ -7,6 +7,7 @@
 
 mod controller;
 mod dev;
+mod env_controller;
 
 use acp_runner_engine::backend::SandboxBackend;
 use acp_runner_engine::creds::{CredentialStore, FileCredentialStore, sync_profiles};
@@ -133,6 +134,20 @@ pub struct RunArgs {
     /// Comma-separated service accounts runner classes may name. Empty = unrestricted.
     #[arg(long, env = "ACP_RUNNER_ALLOWED_SERVICE_ACCOUNTS", value_delimiter = ',', default_value = "")]
     pub allowed_service_accounts: Vec<String>,
+    /// Connection-ticket master key for AgentEnvironments (mounted Secret; >= 32 bytes, raw or
+    /// hex). Without it the AgentEnvironment controller is not started.
+    #[arg(long, env = "ACP_RUNNER_TICKET_KEY_FILE")]
+    pub ticket_key_file: Option<PathBuf>,
+    /// Where runnerd binds an environment's ACP gateway (exposed by a per-environment Service).
+    #[arg(long, env = "ACP_RUNNER_GATEWAY_LISTEN", default_value = "0.0.0.0:7443")]
+    pub gateway_listen: String,
+    /// Runner image for AgentEnvironments (pin by digest in production).
+    #[arg(long, env = "ACP_RUNNER_ENV_IMAGE", default_value = "acp-runner/runner:dev")]
+    pub env_image: String,
+    /// Environment credential leases lapse this long after the last runnerd heartbeat; runnerd
+    /// stops the harness 60 s before that when it cannot reach the controller.
+    #[arg(long, env = "ACP_RUNNER_ENV_LEASE_WINDOW_SECONDS", default_value_t = 900)]
+    pub env_lease_window_seconds: u64,
 }
 
 fn nonempty(v: &[String]) -> Vec<String> {
@@ -217,7 +232,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     let metrics = Arc::new(Metrics::new());
     let engine = Arc::new(Engine {
         journal: journal.clone(),
-        backend,
+        backend: backend.clone(),
         creds: creds.clone(),
         artifacts: artifacts.clone(),
         metrics: metrics.clone(),
@@ -264,8 +279,9 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     }
     let ingest_state = Arc::new(ingest_state);
     let ingest_listener = tokio::net::TcpListener::bind(&args.ingest_listen).await?;
+    let ingest_for_router = ingest_state.clone();
     tokio::spawn(async move {
-        if let Err(e) = axum::serve(ingest_listener, router(ingest_state)).await {
+        if let Err(e) = axum::serve(ingest_listener, router(ingest_for_router)).await {
             tracing::error!(error = %e, "ingest server stopped");
         }
     });
@@ -314,6 +330,41 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         }
     });
 
-    controller::run(client, engine, args.watch_namespace.clone()).await;
+    // AgentEnvironment provider (needs a stable ticket master key)
+    let env_provider = match &args.ticket_key_file {
+        Some(path) => {
+            let ticket_key = acp_runner_engine::environment::TicketKey::from_file(path)
+                .with_context(|| format!("reading ACP_RUNNER_TICKET_KEY_FILE {}", path.display()))?;
+            Some(Arc::new(acp_runner_engine::environment::EnvironmentProvider::new(
+                journal.clone(),
+                backend.clone(),
+                creds.clone(),
+                artifacts.clone(),
+                ingest_state.clone(),
+                acp_runner_engine::environment::EnvironmentConfig {
+                    controller_id: format!("{controller_id}/env"),
+                    ingest_url: args.ingest_url.clone(),
+                    gateway_listen: args.gateway_listen.clone(),
+                    require_egress_proxy_for_credentials: !args.allow_direct_credential_egress,
+                    runner_image: args.env_image.clone(),
+                    ticket_key,
+                    credential_lease_window: Duration::from_secs(args.env_lease_window_seconds.max(120)),
+                    allow_file_repositories: args.allow_file_repos,
+                    ..Default::default()
+                },
+            )))
+        }
+        None => {
+            tracing::warn!("ACP_RUNNER_TICKET_KEY_FILE not set: the AgentEnvironment controller is disabled");
+            None
+        }
+    };
+    let runs = controller::run(client.clone(), engine, args.watch_namespace.clone());
+    match env_provider {
+        Some(p) => {
+            tokio::join!(runs, env_controller::run(client, p, args.watch_namespace.clone()));
+        }
+        None => runs.await,
+    }
     Ok(())
 }

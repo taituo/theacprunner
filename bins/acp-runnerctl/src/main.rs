@@ -29,6 +29,24 @@ enum Cmd {
     /// Runs, attempts, journal events and artifacts (reads PostgreSQL).
     #[command(subcommand)]
     Run(RunCmd),
+    /// AgentEnvironments: connection tickets.
+    #[command(subcommand)]
+    Env(EnvCmd),
+}
+
+#[derive(Subcommand)]
+pub enum EnvCmd {
+    /// Issue a connection ticket for an environment (needs the ticket master key Secret;
+    /// the environment id is in `AgentEnvironment.status.environmentId`). Prints the ticket
+    /// and the gateway reference only.
+    Ticket {
+        environment_id: uuid::Uuid,
+        #[arg(long, env = "ACP_RUNNER_TICKET_KEY_FILE")]
+        ticket_key_file: PathBuf,
+        /// Lifetime in seconds.
+        #[arg(long, default_value_t = 900)]
+        ttl: i64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
@@ -182,6 +200,14 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Auth(c) => auth::run(*c).await,
+        Cmd::Env(EnvCmd::Ticket { environment_id, ticket_key_file, ttl }) => {
+            let key = acp_runner_engine::environment::TicketKey::from_file(&ticket_key_file)?;
+            let (t, exp) =
+                acp_runner_engine::environment::issue_ticket_with(&key, environment_id, ttl.clamp(30, 86_400))?;
+            println!("{t}");
+            eprintln!("expires at unix {exp}");
+            Ok(())
+        }
         Cmd::Run(c) => runs::run(c).await,
     }
 }

@@ -8,6 +8,7 @@ use acp_runner_core::credentials::{CredentialBundle, Provider, validate_bundle};
 use acp_runner_core::environment::{
     EnvironmentOutput, EnvironmentOverrides, EnvironmentPhase, EnvironmentSpec, HarnessSpec, Lifetime, OutputArtifact,
 };
+use acp_runner_core::failure::FailureReason;
 use acp_runner_core::spec::RepositoryInput;
 use acp_runner_engine::backend::LocalProcessBackend;
 use acp_runner_engine::bundles::StaticBundleProvider;
@@ -22,7 +23,7 @@ use acp_runner_journal::{ArtifactStore, PgArtifactStore};
 use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 fn bins() {
@@ -600,5 +601,57 @@ async fn harness_provider_materializes_pinned_artifacts() {
     spec.harness = harness("1.0.0", None);
     let e = h.provider.create(spec).await.unwrap_err().to_string();
     assert!(e.contains("does not match the pinned"), "{e}");
+    h.done().await;
+}
+
+/// V10: a frozen runnerd is detected by heartbeat loss; the sandbox is terminated and the
+/// credential lease released only once the backend reports it gone.
+#[tokio::test]
+async fn lost_environment_is_failed_and_its_lease_fenced() {
+    let Some(h) = H::new().await else { return };
+    let mut bundle = CredentialBundle::new();
+    bundle.insert("auth.json".into(), fake_codex_auth("acct-1"));
+    let md = validate_bundle(Provider::Codex, &bundle).unwrap();
+    h.creds
+        .save(
+            &StoredProfile {
+                name: "codex-1".into(),
+                provider: Provider::Codex,
+                max_concurrent_leases: 1,
+                metadata: md,
+                store_ref: String::new(),
+                policy: acp_runner_engine::creds::ProfilePolicy::any(),
+            },
+            &bundle,
+        )
+        .await
+        .unwrap();
+    sync_profiles(h.creds.as_ref(), &h.provider.journal).await.unwrap();
+    let mut spec = h.spec("lost");
+    spec.harness = HarnessSpec::named("codex");
+    spec.credentials.profile = Some("codex-1".into());
+    let v = h.provider.create(spec).await.unwrap();
+    h.provider.connect(v.id, Duration::from_secs(60)).await.unwrap();
+    let name = h.backend.names().pop().unwrap();
+    assert!(h.backend.simulate_hang(&name));
+    let start = Instant::now();
+    let view = loop {
+        let view = h.provider.get(v.id).await.unwrap().unwrap();
+        if view.phase.is_terminal() {
+            break view;
+        }
+        assert!(start.elapsed() < Duration::from_secs(120), "heartbeat loss not detected");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+    assert!(matches!(view.failure, Some(FailureReason::HeartbeatLost { .. })), "{view:?}");
+    let start = Instant::now();
+    while !h.provider.cleanup(v.id).await.unwrap() {
+        assert!(start.elapsed() < Duration::from_secs(60));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    let env = h.provider.journal.get_environment(v.id).await.unwrap().unwrap();
+    let a = h.provider.journal.get_attempt(env.attempt_id).await.unwrap();
+    assert!(a.sandbox_released_at.is_some());
+    assert!(h.provider.journal.active_leases().await.unwrap().is_empty());
     h.done().await;
 }
