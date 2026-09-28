@@ -38,8 +38,15 @@ jobs:
         run: |
           curl -sSL -o envtest.tgz "https://github.com/kubernetes-sigs/controller-tools/releases/download/envtest-${ENVTEST_VERSION}/envtest-${ENVTEST_VERSION}-linux-amd64.tar.gz"
           mkdir -p .cache/envtest && tar xzf envtest.tgz -C .cache/envtest
-          BIN=$(dirname "$(find .cache/envtest -name kube-apiserver)")
-          echo "ACP_E2E_KUBECONFIG=$(ENVTEST_BIN=$BIN scripts/envtest-up.sh)" >> "$GITHUB_ENV"
+          APISERVER=$(find .cache/envtest -name kube-apiserver -type f | head -1)
+          [ -n "$APISERVER" ] || { echo "::error::kube-apiserver not found in the envtest bundle"; find .cache/envtest | head -20; exit 1; }
+          if ! KCFG=$(ENVTEST_BIN=$(dirname "$APISERVER") ENVTEST_READY_SECONDS=180 scripts/envtest-up.sh); then
+            for f in /tmp/acp-runner-envtest/apiserver.log /tmp/acp-runner-envtest/etcd.log; do
+              echo "::error title=$(basename "$f")::$(tail -c 3000 "$f" | tr '\n' ' ')"
+            done
+            exit 1
+          fi
+          echo "ACP_E2E_KUBECONFIG=$KCFG" >> "$GITHUB_ENV"
           curl -sSL -o .cache/agent-sandbox.yaml https://github.com/kubernetes-sigs/agent-sandbox/releases/download/v1.0.4/sandbox-with-extensions.yaml
           echo "ACP_E2E_AGENT_SANDBOX_CRDS=$PWD/.cache/agent-sandbox.yaml" >> "$GITHUB_ENV"
       - name: fmt, clippy, unit + integration + envtest e2e

@@ -69,7 +69,8 @@ contexts:
 current-context: envtest
 EOF
 
-for _ in $(seq 1 120); do
+# half-second polls; ENVTEST_READY_SECONDS (default 60) bounds the wait
+for _ in $(seq 1 $(( ${ENVTEST_READY_SECONDS:-60} * 2 ))); do
   if KUBECONFIG="$DIR/kubeconfig" "$BIN/kubectl" get --raw /readyz >/dev/null 2>&1; then
     echo "$DIR/kubeconfig"
     exit 0
