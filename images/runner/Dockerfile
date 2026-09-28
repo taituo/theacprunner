@@ -47,7 +47,7 @@ FROM ${NODE_IMAGE} AS fixtures
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY tests/fixtures/buggy-repo /src/tests/fixtures/buggy-repo
 COPY scripts/build-fixture-repo.sh /src/scripts/build-fixture-repo.sh
-RUN /src/scripts/build-fixture-repo.sh /out/buggy-repo.git > /out/buggy-repo.sha
+RUN mkdir -p /out && /src/scripts/build-fixture-repo.sh /out/buggy-repo.git > /out/buggy-repo.sha
 
 FROM ${NODE_IMAGE}
 RUN apt-get update \
