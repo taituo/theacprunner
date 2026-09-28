@@ -24,6 +24,7 @@ pub mod environment;
 pub mod events;
 pub mod failure;
 pub mod harness;
+pub mod launch;
 pub mod paths;
 pub mod plan;
 pub mod redact;

@@ -30,6 +30,11 @@ pub struct RunSpec {
     pub resume: ResumePolicy,
     /// `[primary, fallback_1, fallback_2, ...]`, resolved and snapshotted.
     pub runner_classes: Vec<RunnerClassSpec>,
+    /// Per-run `env`/`files` additions to the primary class' launch (e.g. the model).
+    /// Requires `allowRunOverrides` on that class; fallbacks keep their own defaults
+    /// (model names are CLI-specific).
+    #[serde(default, skip_serializing_if = "crate::launch::RunOverrides::is_empty")]
+    pub overrides: crate::launch::RunOverrides,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -168,6 +173,26 @@ pub struct RunnerClassSpec {
     pub run_as_user: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_account_name: Option<String>,
+    /// How to start an ACP stdio agent (driver `acp`; also honoured by `fake`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch: Option<crate::launch::Launch>,
+    /// Runs may add `env`/`files` to `launch` (`ACPRun.spec.overrides`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_run_overrides: bool,
+}
+
+/// Drivers that start an ACP stdio agent from a launch description.
+pub const LAUNCH_DRIVERS: &[&str] = &["acp", "fake"];
+
+impl RunnerClassSpec {
+    /// The launch of this class with `overrides` applied (only for the primary class).
+    pub fn effective_launch(&self, overrides: Option<&crate::launch::RunOverrides>) -> Option<crate::launch::Launch> {
+        let l = self.launch.as_ref()?;
+        Some(match overrides {
+            Some(o) if self.allow_run_overrides => l.with_overrides(o),
+            _ => l.clone(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -373,6 +398,23 @@ impl RunSpec {
         if self.runner_classes.is_empty() {
             return Err(SpecError::NoRunnerClass);
         }
+        if !self.overrides.is_empty() {
+            let primary = &self.runner_classes[0];
+            if !primary.allow_run_overrides {
+                return Err(SpecError::BadRunnerClass(
+                    primary.name.clone(),
+                    "the run sets overrides but the class does not set allowRunOverrides".into(),
+                ));
+            }
+            if primary.launch.is_none() {
+                return Err(SpecError::BadRunnerClass(
+                    primary.name.clone(),
+                    "overrides need a class with a launch description".into(),
+                ));
+            }
+            crate::launch::validate_env(&self.overrides.env).map_err(|e| SpecError::Invalid("overrides", e))?;
+            crate::launch::validate_files(&self.overrides.files).map_err(|e| SpecError::Invalid("overrides", e))?;
+        }
         for c in &self.runner_classes {
             c.validate()?;
             // An HTTP CONNECT proxy carries https:// fetches; ssh:// and git:// cannot pass.
@@ -446,6 +488,14 @@ impl RunnerClassSpec {
         }
         for p in &self.workspace.allowed_paths {
             validate_relative_path(p).map_err(|err| SpecError::BadAllowedPath { path: p.clone(), err })?;
+        }
+        match (&self.launch, self.driver.as_str()) {
+            (Some(l), d) if LAUNCH_DRIVERS.contains(&d) => l.validate().map_err(|e| bad(&e))?,
+            (Some(_), d) => return Err(bad(&format!("driver {d} does not take a launch description"))),
+            (None, "acp") if self.driver_config.get("command").and_then(|c| c.as_str()).is_none() => {
+                return Err(bad("driver acp requires launch.command"));
+            }
+            _ => {}
         }
         if self.egress.effective_mode() == EgressMode::Proxy {
             match self.egress.https_proxy.as_deref() {
@@ -591,6 +641,8 @@ pub(crate) mod tests {
             env: BTreeMap::new(),
             run_as_user: None,
             service_account_name: None,
+            launch: None,
+            allow_run_overrides: false,
         }
     }
 
@@ -609,6 +661,7 @@ pub(crate) mod tests {
             timeouts: TimeoutOverrides::default(),
             resume: ResumePolicy::default(),
             runner_classes: vec![class("claude-default", "claude"), class("codex-default", "codex")],
+            overrides: Default::default(),
         }
     }
 

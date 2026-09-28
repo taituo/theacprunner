@@ -83,12 +83,19 @@ pub struct ACPRunnerClassSpec {
     pub run_as_user: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_account_name: Option<String>,
+    /// How to start an ACP stdio agent (`driver: acp`): command, args, env, files placed
+    /// below HOME, cwd. Model, trust and update settings are plain launch parameters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch: Option<acp_runner_core::launch::Launch>,
+    /// Allow `ACPRun.spec.overrides` (env/files additions, e.g. the model) for this class.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_run_overrides: bool,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, JsonSchema, Default, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ClassCredentials {
-    /// `codex` or `claude`; omit for drivers without credentials.
+    /// `codex`, `claude` or `files`; omit for drivers without credentials.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
     /// Enrolled credential profile names, tried in order.
@@ -208,6 +215,10 @@ pub struct ACPRunSpec {
     pub timeouts: Option<RunTimeouts>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume: Option<RunResume>,
+    /// Per-run additions to the primary class' launch (`env` keys, `files` by target);
+    /// requires `allowRunOverrides` on that class.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overrides: Option<acp_runner_core::launch::RunOverrides>,
     /// Set to true to cancel the run (sandbox terminated, lease released).
     #[serde(default)]
     pub cancel: bool,
@@ -406,6 +417,8 @@ impl ACPRunnerClassSpec {
             env: self.env.iter().map(|e| (e.name.clone(), e.value.clone())).collect(),
             run_as_user: self.run_as_user,
             service_account_name: self.service_account_name.clone(),
+            launch: self.launch.clone(),
+            allow_run_overrides: self.allow_run_overrides,
         }
     }
 }
@@ -451,6 +464,7 @@ impl ACPRunSpec {
                 max_transcript_messages: r.max_transcript_messages.unwrap_or(dr.max_transcript_messages),
             },
             runner_classes: classes,
+            overrides: self.overrides.clone().unwrap_or_default(),
         }
     }
 

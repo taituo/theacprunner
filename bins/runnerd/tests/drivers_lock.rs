@@ -23,7 +23,15 @@ fn drivers_lock_matches_image_pins_and_registry() {
     for known in acp_runner_drivers::KNOWN_DRIVERS {
         assert!(names.contains(known), "driver {known} missing from drivers.lock.yaml");
     }
-    for d in drivers {
+    let profiles: Vec<&serde_yaml::Value> =
+        drivers.iter().filter_map(|d| d["profiles"].as_sequence()).flatten().collect();
+    for p in &profiles {
+        for f in ["launch", "report"] {
+            let path = p[f].as_str().unwrap();
+            assert!(root().join(path).exists(), "{path} referenced by drivers.lock.yaml is missing");
+        }
+    }
+    for d in drivers.iter().chain(profiles.iter().copied()) {
         let status = d["status"].as_str().unwrap();
         assert!(allowed.contains(&status), "unknown status {status}");
         for part in ["cli", "adapter"] {

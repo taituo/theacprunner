@@ -318,6 +318,8 @@ pub(crate) mod tests {
                 env: Default::default(),
                 run_as_user: None,
                 service_account_name: None,
+                launch: None,
+                allow_run_overrides: false,
             },
             ingest_url: "http://acp-runner-ingest.acp-runner-system.svc:8081".into(),
             token: "t".repeat(64),

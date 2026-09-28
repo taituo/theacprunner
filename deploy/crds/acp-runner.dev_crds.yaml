@@ -34,6 +34,9 @@ spec:
         properties:
           spec:
             properties:
+              allowRunOverrides:
+                description: Allow `ACPRun.spec.overrides` (env/files additions, e.g. the model) for this class.
+                type: boolean
               credentials:
                 default: {}
                 properties:
@@ -48,7 +51,7 @@ spec:
                       type: string
                     type: array
                   provider:
-                    description: '`codex` or `claude`; omit for drivers without credentials.'
+                    description: '`codex`, `claude` or `files`; omit for drivers without credentials.'
                     nullable: true
                     type: string
                 type: object
@@ -104,6 +107,53 @@ spec:
               imagePullPolicy:
                 nullable: true
                 type: string
+              launch:
+                description: |-
+                  How to start an ACP stdio agent (`driver: acp`): command, args, env, files placed
+                  below HOME, cwd. Model, trust and update settings are plain launch parameters.
+                nullable: true
+                properties:
+                  args:
+                    items:
+                      type: string
+                    type: array
+                  command:
+                    description: Program (absolute path or a name resolved through the agent PATH).
+                    type: string
+                  cwd:
+                    description: 'Working directory relative to the workspace (default: the workspace / workdir).'
+                    nullable: true
+                    type: string
+                  env:
+                    additionalProperties:
+                      type: string
+                    type: object
+                  files:
+                    items:
+                      description: |-
+                        A file written below the synthetic HOME before the agent starts (never into the
+                        workspace, so it cannot end up in the patch).
+                      properties:
+                        content:
+                          description: UTF-8 content.
+                          type: string
+                        mode:
+                          description: File mode (default 0600).
+                          format: int32
+                          minimum: 0.0
+                          nullable: true
+                          type: integer
+                        target:
+                          description: Path relative to HOME, e.g. `.config/opencode/opencode.json`.
+                          type: string
+                      required:
+                      - content
+                      - target
+                      type: object
+                    type: array
+                required:
+                - command
+                type: object
               permissions:
                 default: {}
                 properties:
@@ -277,6 +327,10 @@ spec:
               output:
                 nullable: true
                 properties:
+                  allowSubmodules:
+                    description: Accept gitlinks and `.gitmodules` changes (default false).
+                    nullable: true
+                    type: boolean
                   maxPatchBytes:
                     format: int64
                     minimum: 0.0
@@ -289,6 +343,40 @@ spec:
                     description: '`Patch` (default) or `None`.'
                     nullable: true
                     type: string
+                type: object
+              overrides:
+                description: |-
+                  Per-run additions to the primary class' launch (`env` keys, `files` by target);
+                  requires `allowRunOverrides` on that class.
+                nullable: true
+                properties:
+                  env:
+                    additionalProperties:
+                      type: string
+                    type: object
+                  files:
+                    items:
+                      description: |-
+                        A file written below the synthetic HOME before the agent starts (never into the
+                        workspace, so it cannot end up in the patch).
+                      properties:
+                        content:
+                          description: UTF-8 content.
+                          type: string
+                        mode:
+                          description: File mode (default 0600).
+                          format: int32
+                          minimum: 0.0
+                          nullable: true
+                          type: integer
+                        target:
+                          description: Path relative to HOME, e.g. `.config/opencode/opencode.json`.
+                          type: string
+                      required:
+                      - content
+                      - target
+                      type: object
+                    type: array
                 type: object
               prompt:
                 properties:

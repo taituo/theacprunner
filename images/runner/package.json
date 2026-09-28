@@ -6,7 +6,8 @@
   "license": "UNLICENSED",
   "dependencies": {
     "@agentclientprotocol/codex-acp": "1.13.1",
+    "@anthropic-ai/claude-code": "2.1.274",
     "@openai/codex": "0.156.1",
-    "@anthropic-ai/claude-code": "2.1.274"
+    "opencode-ai": "1.18.32"
   }
 }

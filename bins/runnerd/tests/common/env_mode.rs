@@ -59,6 +59,7 @@ pub fn env_spec(env: &TestEnv, environment_id: Uuid) -> AttemptSpec {
             max_lifetime_seconds: None,
         },
         bootstrap: Default::default(),
+        home_files: vec![],
     }
 }
 

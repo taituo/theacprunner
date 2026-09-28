@@ -263,13 +263,14 @@ pub trait AgentProcess: Send {
 pub fn driver_for(name: &str) -> Result<Box<dyn AgentDriver>, DriverError> {
     match name {
         "fake" => Ok(Box::new(acp_driver::AcpDriver::fake())),
+        "acp" => Ok(Box::new(acp_driver::AcpDriver::generic())),
         "codex" => Ok(Box::new(codex::CodexDriver)),
         "claude" => Ok(Box::new(claude::ClaudeDriver)),
-        other => Err(DriverError::Unsupported(format!("unknown driver {other:?} (known: fake, codex, claude)"))),
+        other => Err(DriverError::Unsupported(format!("unknown driver {other:?} (known: acp, fake, codex, claude)"))),
     }
 }
 
-pub const KNOWN_DRIVERS: &[&str] = &["fake", "codex", "claude"];
+pub const KNOWN_DRIVERS: &[&str] = &["acp", "fake", "codex", "claude"];
 
 /// Run a short command and capture (stdout, stderr, exit code) with a timeout.
 pub(crate) async fn run_capture(

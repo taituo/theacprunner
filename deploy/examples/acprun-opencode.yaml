@@ -1,0 +1,13 @@
+# One run, model chosen per run. A run override replaces the whole OPENCODE_CONFIG_CONTENT
+# value, so it repeats the provider endpoint of the class (see README "opencode").
+apiVersion: acp-runner.dev/v1alpha1
+kind: ACPRun
+metadata: {name: opencode-smoke-1, namespace: acp-agents}
+spec:
+  taskId: opencode-smoke
+  runnerClassName: opencode
+  repository: {url: file:///opt/acp-runner/fixtures/fixture.git, revision: main}
+  prompt: {text: "add.sh prints the difference instead of the sum. Fix add.sh so that `sh test.sh` prints PASS."}
+  overrides:
+    env:
+      OPENCODE_CONFIG_CONTENT: '{"model": "openai/gpt-5-nano", "provider": {"openai": {"options": {"baseURL": "https://api.openai.com/v1"}}}}'

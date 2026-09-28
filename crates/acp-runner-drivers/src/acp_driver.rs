@@ -1,4 +1,9 @@
-//! Generic ACP (stdio) agent process, used by the `fake` and `codex` drivers.
+//! Generic ACP (stdio) agent process, used by the `acp`, `fake` and `codex` drivers.
+//!
+//! The `acp` driver starts any ACP stdio agent from a launch description in its config
+//! (`command`, `args`, `env`, `cwd`; see `acp_runner_core::launch`). It has no knowledge of
+//! a particular CLI: differences between ACP implementations are found by the conformance
+//! suite (`bins/runnerd/tests/conformance.rs`, `scripts/conformance.sh`), not coded here.
 
 use crate::process::{ExitInfo, ManagedChild, SpawnSpec};
 use crate::{
@@ -29,6 +34,8 @@ pub struct AcpLaunch {
     pub program: String,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
+    /// Process (and ACP session) working directory; `None` = the workspace/workdir.
+    pub cwd: Option<std::path::PathBuf>,
 }
 
 /// The deterministic fake ACP driver (and the base for other ACP drivers).
@@ -42,15 +49,33 @@ impl AcpDriver {
         AcpDriver { name: "fake", default_command: "fake-acp-agent" }
     }
 
+    /// Any ACP stdio agent; `command` is required.
+    pub fn generic() -> Self {
+        AcpDriver { name: "acp", default_command: "" }
+    }
+
     fn launch(&self, ctx: &DriverContext) -> Result<AcpLaunch, DriverError> {
         let program = cfg_str(&ctx.config, "command").unwrap_or_else(|| self.default_command.to_string());
+        if program.trim().is_empty() {
+            return Err(DriverError::Config(format!("driver {} requires launch.command", self.name)));
+        }
         let args = cfg_str_list(&ctx.config, "args");
         let mut driver_env = cfg_env(&ctx.config, "env");
-        if let Some(s) = cfg_str(&ctx.config, "scenario") {
-            driver_env.push(("FAKE_ACP_SCENARIO".into(), s));
+        if self.name == "fake" {
+            if let Some(s) = cfg_str(&ctx.config, "scenario") {
+                driver_env.push(("FAKE_ACP_SCENARIO".into(), s));
+            }
+            driver_env.push(("FAKE_ACP_ATTEMPT_ORDINAL".into(), ctx.ordinal.to_string()));
         }
-        driver_env.push(("FAKE_ACP_ATTEMPT_ORDINAL".into(), ctx.ordinal.to_string()));
-        Ok(AcpLaunch { driver: self.name, program, args, env: env::compose(ctx, &driver_env)? })
+        let cwd = match cfg_str(&ctx.config, "cwd").filter(|c| !c.is_empty()) {
+            Some(c) => {
+                acp_runner_core::paths::validate_relative_path(&c)
+                    .map_err(|e| DriverError::Config(format!("launch.cwd: {e}")))?;
+                Some(ctx.workspace.join(c))
+            }
+            None => None,
+        };
+        Ok(AcpLaunch { driver: self.name, program, args, env: env::compose(ctx, &driver_env)?, cwd })
     }
 }
 
@@ -90,7 +115,8 @@ impl AgentDriver for AcpDriver {
 
     fn acp_spawn(&self, ctx: &DriverContext) -> Result<SpawnSpec, DriverError> {
         let l = self.launch(ctx)?;
-        Ok(SpawnSpec { program: l.program, args: l.args, env: l.env, cwd: ctx.workspace.clone() })
+        let cwd = l.cwd.unwrap_or_else(|| ctx.workspace.clone());
+        Ok(SpawnSpec { program: l.program, args: l.args, env: l.env, cwd })
     }
 }
 
@@ -115,8 +141,8 @@ pub struct AcpProcess {
 
 impl AcpProcess {
     pub fn spawn(ctx: &DriverContext, launch: AcpLaunch) -> Result<AcpProcess, DriverError> {
-        let spec =
-            SpawnSpec { program: launch.program, args: launch.args, env: launch.env, cwd: ctx.workspace.clone() };
+        let cwd = launch.cwd.clone().unwrap_or_else(|| ctx.workspace.clone());
+        let spec = SpawnSpec { program: launch.program, args: launch.args, env: launch.env, cwd: cwd.clone() };
         let mut child = ManagedChild::spawn(&spec)?;
         let stdin = child.take_stdin().ok_or_else(|| DriverError::Spawn("no stdin".into()))?;
         let stdout = child.take_stdout().ok_or_else(|| DriverError::Spawn("no stdout".into()))?;
@@ -137,7 +163,7 @@ impl AcpProcess {
             allow_permissions: ctx.permissions.mode == PermissionMode::AllowAll,
             record_raw: ctx.record_raw,
             last_message: String::new(),
-            workspace: ctx.workspace.clone(),
+            workspace: cwd,
             init: None,
         })
     }

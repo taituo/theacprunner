@@ -336,6 +336,20 @@ pub fn place_credentials(
     Ok(out)
 }
 
+/// Launch files (`launch.files`, run overrides) below the HOME: replaced atomically without
+/// following links. Not secrets, but trusted configuration — the agent reads what the class
+/// says, not what an earlier untrusted step left at that path.
+pub fn place_launch_files(home: &Path, files: &[acp_runner_core::launch::LaunchFile]) -> Result<usize, FailureReason> {
+    for f in files {
+        replace_beneath(home, &f.target, f.content.as_bytes(), f.mode.unwrap_or(0o600)).map_err(|e| {
+            FailureReason::WorkspacePolicyViolation {
+                detail: format!("cannot place launch file {:?} (refusing to follow links): {e}", f.target),
+            }
+        })?;
+    }
+    Ok(files.len())
+}
+
 /// Refreshed credential files that differ from what was placed. Read without following
 /// symlinks; anything that is not a regular file of sane size is ignored.
 pub fn changed_writeback_files(home: &Path, prepared: &PreparedHome) -> Vec<(String, Vec<u8>)> {

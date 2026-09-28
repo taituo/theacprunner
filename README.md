@@ -680,7 +680,8 @@ trait AgentProcess {
 
 Driver configuration (`ACPRunnerClass.spec.driverConfig`):
 
-* `fake`: `command`, `args`, `scenario`, `env`
+* `acp`: set through `launch` (`command` required, `args`, `env`, `cwd`)
+* `fake`: `command`, `args`, `scenario`, `env` (also accepts `launch`)
 * `codex`: `mode` (`agent-full-access` default | `agent` | `read-only`), `model`,
   `reasoningEffort`, `codexConfig{}` (→ `CODEX_CONFIG`), `extraConfigToml`,
   `adapterCommand` (`codex-acp`), `adapterArgs`, `codexCommand` (`codex`, passed as
@@ -690,7 +691,44 @@ Driver configuration (`ACPRunnerClass.spec.driverConfig`):
   `disableNonessentialTraffic` (true), `extraArgs[]` (`--bare` refused), `command`,
   `commandArgs`, `env`
 
-To add a CLI: implement the traits in a new module (an ACP-speaking CLI can reuse
+**Generic ACP driver (`driver: acp`).** Any ACP stdio CLI runs from a launch description in
+the runner class — no Rust code, no flag schema:
+
+```yaml
+launch: {command: opencode, args: [acp, --pure], env: {...}, files: [{target, content, mode}], cwd: sub/dir}
+allowRunOverrides: true      # lets ACPRun.spec.overrides {env, files} add/replace keys (primary class only)
+```
+
+`files` are written below the synthetic HOME by runnerd (never into the workspace, so they
+are not part of the patch; in environments after the untrusted bootstrap). Runtime variables
+(`HOME`, `XDG_*`, `PATH`, `TMPDIR`, proxy and CA variables) are always set last and cannot be
+changed by a launch or an override. An environment uses the same shape as
+`harness: {name: acp, config: <launch>}`; its credential layout comes from the profile's
+provider. Differences between ACP implementations are measured, not coded:
+`acp-conformance --launch <file>` (or `scripts/conformance.sh`) records handshake latency,
+capabilities, auth methods, session config options (e.g. the model selector), prompt and
+cancel behaviour, permission and client requests, and shutdown on stdin EOF as a profile in
+`conformance/`, summarized under `profiles:` in `drivers.lock.yaml`.
+
+**opencode** (profile `conformance/opencode.launch.yaml`, pinned `opencode-ai` 1.18.32).
+Recorded without a real key: config precedence is global file < `OPENCODE_CONFIG` <
+repository `opencode.json` < `OPENCODE_CONFIG_CONTENT`, so the class keeps the default model
+**and the provider endpoint** in `OPENCODE_CONFIG_CONTENT` — with that, a repository's own
+`opencode.json` changed neither the model nor where requests (and the key) go. A run that
+chooses its model overrides the whole `OPENCODE_CONFIG_CONTENT` value and must repeat the
+endpoint; runs are created by namespaces the profile policy already trusts, and the egress
+proxy allowlist still bounds where a key can go. `--pure` disables external plugins.
+opencode does not exit on stdin EOF; runnerd's terminate path handles it. Credentials:
+provider `files` (a provider-keyed `auth.json` with `{"type":"api","key":...}` entries;
+OAuth entries are refused until they get a verified write-back like Codex):
+`acp-runnerctl auth enroll files openai-test --from-file ~/.local/share/opencode/auth.json
+--select openai --allow-namespace acp-agents` (or `--token-stdin --select openai`). This is
+the one place where API keys are accepted — the ban applies to the Codex and Claude
+subscriptions. Examples: `deploy/examples/runnerclass-opencode.yaml`,
+`deploy/examples/acprun-opencode.yaml`. Not yet recorded: a live prompt/cancel with a real
+OpenAI key (`ACP_CONFORMANCE_AUTH_JSON=... scripts/conformance.sh`).
+
+To add a CLI with its own driver: implement the traits in a new module (an ACP-speaking CLI can reuse
 `acp_driver::AcpProcess`), register it in `driver_for`, add its credential whitelist to
 `acp-runner-core/src/credentials.rs` if it needs one, pin it in `images/runner/package.json`,
 add a `drivers.lock.yaml` entry and a compat target. CRDs, engine, journal and controller do

@@ -32,6 +32,7 @@ use acp_runner_core::environment::{
 use acp_runner_core::events::{EventKind, RunnerDirective};
 use acp_runner_core::failure::FailureReason;
 use acp_runner_core::harness::{HarnessArtifactRef, bundle_placement, credential_provider};
+use acp_runner_core::launch::Launch;
 use acp_runner_core::spec::{OutputKind, RepositoryInput, TimeoutPolicy};
 use acp_runner_core::ticket;
 use acp_runner_core::{RunPhase, WIRE_VERSION};
@@ -283,6 +284,8 @@ impl EnvironmentProvider {
             env: spec.env.clone(),
             run_as_user: None,
             service_account_name: None,
+            launch: None,
+            allow_run_overrides: false,
         }
     }
 
@@ -498,10 +501,18 @@ impl EnvironmentProvider {
         let ws = self.resolve_workspace(&spec).await?;
         let mounts = self.resolve_bundles(&spec, &driver, &workdir).await?;
         let provider = match spec.credentials.profile.as_deref() {
-            Some(_) => Some(
-                credential_provider(&driver)
-                    .ok_or_else(|| anyhow::anyhow!("harness {driver} has no credential layout"))?,
-            ),
+            Some(profile) => Some(match credential_provider(&driver) {
+                Some(p) => p,
+                // A generic ACP harness takes the layout of the profile's own provider.
+                None if driver == "acp" => self
+                    .journal
+                    .get_profile(profile)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("credential profile {profile} is not enrolled"))?
+                    .provider
+                    .parse()?,
+                None => anyhow::bail!("harness {driver} has no credential layout"),
+            }),
             None => None,
         };
         // The stored spec records the resolved origin (source pinned to the overlays' base).
@@ -540,6 +551,15 @@ impl EnvironmentProvider {
             lineage: ws.lineage,
             produce_artifact: spec.produces_artifact(),
         };
+        // `harness: {name: acp, config: <launch>}`: launch files go below HOME (runnerd),
+        // the rest is the driver configuration.
+        let (driver_config, home_files) = if driver == "acp" {
+            let l = Launch::from_config(&spec.harness.config).map_err(|e| anyhow::anyhow!("harness acp: {e}"))?;
+            l.validate().map_err(|e| anyhow::anyhow!("harness acp: {e}"))?;
+            (l.driver_config(&serde_json::json!({})), l.files)
+        } else {
+            (spec.harness.config.clone(), vec![])
+        };
         let mut attempt_spec = AttemptSpec {
             wire_version: WIRE_VERSION,
             run_id: run.id,
@@ -548,7 +568,7 @@ impl EnvironmentProvider {
             ordinal: 1,
             class_attempt: 1,
             runner_class: format!("env:{}", spec.harness.name),
-            driver: DriverSpec { name: driver.clone(), config: spec.harness.config.clone() },
+            driver: DriverSpec { name: driver.clone(), config: driver_config },
             repository: ws.source.clone().unwrap_or_else(|| RepositoryInput {
                 url: "empty:".into(),
                 revision: "empty".into(),
@@ -578,6 +598,7 @@ impl EnvironmentProvider {
                 max_lifetime_seconds: spec.lifetime.max_seconds,
             },
             bootstrap: plan,
+            home_files,
         };
         // Credential lease for the environment's lifetime (not per turn): acquired now,
         // renewed by runnerd's heartbeats, released after the validated write-back at the end.

@@ -143,6 +143,8 @@ impl H {
             env: [("FAKE_ACP_SCENARIO".to_string(), scenario.to_string())].into_iter().collect(),
             run_as_user: None,
             service_account_name: None,
+            launch: None,
+            allow_run_overrides: false,
         }
     }
 
@@ -164,6 +166,7 @@ impl H {
                 timeouts: TimeoutOverrides::default(),
                 resume: ResumePolicy::default(),
                 runner_classes: classes,
+                overrides: Default::default(),
             },
             cancel: false,
         }
@@ -967,5 +970,64 @@ async fn image_and_service_account_allowlists_are_enforced() {
     f.service_account_name = Some("acp-agent".into());
     let v = h.drive(&h.input(vec![f], 1), Duration::from_secs(30)).await;
     assert_eq!(v.phase, RunPhase::Succeeded, "uncredentialed classes need no pinned image: {v:?}");
+    h.done().await;
+}
+
+/// V9: the generic `acp` driver starts an agent from a launch description; run overrides
+/// (env/files) apply to the primary class only when it allows them.
+#[tokio::test]
+async fn acp_launch_and_run_overrides() {
+    let Some(h) = H::new().await else { return };
+    let launch_class = |allow: bool| {
+        let mut c = h.class("acp-launch", "crash");
+        c.driver = "acp".into();
+        c.driver_config = json!({});
+        c.env.clear();
+        c.allow_run_overrides = allow;
+        c.launch = Some(acp_runner_core::launch::Launch {
+            command: h.fake.to_string_lossy().to_string(),
+            args: vec![],
+            env: [("FAKE_ACP_SCENARIO".to_string(), "crash".to_string())].into_iter().collect(),
+            files: vec![acp_runner_core::launch::LaunchFile {
+                target: ".config/fake/launch.json".into(),
+                content: r#"{"model":"default"}"#.into(),
+                mode: None,
+            }],
+            cwd: None,
+        });
+        c
+    };
+    let overrides = acp_runner_core::launch::RunOverrides {
+        env: [("FAKE_ACP_SCENARIO".to_string(), "fix".to_string())].into_iter().collect(),
+        files: vec![],
+    };
+    // without overrides the launch's own env applies (crash)
+    let v = h.drive(&h.input(vec![launch_class(true)], 1), Duration::from_secs(60)).await;
+    assert_eq!(v.phase, RunPhase::Failed, "{v:?}");
+    // the run's override replaces the key -> fix
+    let mut input = h.input(vec![launch_class(true)], 1);
+    input.spec.overrides = overrides.clone();
+    let v = h.drive(&input, Duration::from_secs(60)).await;
+    assert_eq!(v.phase, RunPhase::Succeeded, "{v:?}");
+    let evs = h.engine.journal.events_for_run(v.run_id, 0, 10_000).await.unwrap();
+    assert!(evs.iter().any(|e| e.data["category"] == "launch_files_placed"), "launch files not placed");
+    // overrides on a class that does not allow them: refused before any attempt
+    let mut input = h.input(vec![launch_class(false)], 1);
+    input.spec.overrides = overrides.clone();
+    let v = h.drive(&input, Duration::from_secs(30)).await;
+    assert_eq!(v.phase, RunPhase::Failed, "{v:?}");
+    assert_eq!(v.attempt_count, 0);
+    assert!(v.failure.unwrap().message().contains("allowRunOverrides"));
+    // fallback classes keep their own launch (overrides are for the primary class only)
+    let mut fallback = launch_class(true);
+    fallback.name = "acp-fallback".into();
+    let mut input = h.input(vec![launch_class(true), fallback], 1);
+    input.spec.overrides = acp_runner_core::launch::RunOverrides {
+        env: [("FAKE_ACP_SCENARIO".into(), "crash".into())].into(),
+        files: vec![],
+    };
+    input.spec.runner_classes[1].launch.as_mut().unwrap().env.insert("FAKE_ACP_SCENARIO".into(), "fix".into());
+    let v = h.drive(&input, Duration::from_secs(90)).await;
+    assert_eq!(v.phase, RunPhase::Succeeded, "fallback got the primary's override: {v:?}");
     h.done().await;
 }

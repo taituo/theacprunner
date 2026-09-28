@@ -54,6 +54,8 @@ jobs:
           cargo deny check advisories licenses
       - name: driver compatibility (fake + real codex adapter without credentials)
         run: scripts/compat.sh --targets fake-acp,fake-claude,codex-noauth
+      - name: ACP conformance profile (opencode, no credentials)
+        run: scripts/conformance.sh && cat conformance/opencode-*-noauth.json
 
   images:
     runs-on: ubuntu-24.04

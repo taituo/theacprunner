@@ -89,6 +89,11 @@ pub fn compose(ctx: &DriverContext, driver_env: &[(String, String)]) -> Result<V
                 "environment variable {k} is forbidden for agent processes (API-key billing / credential leak guard)"
             )));
         }
+        if acp_runner_core::launch::is_protected_env(&k) {
+            // The runtime's own values (HOME, XDG_*, proxy, CA, PATH) always win; a class
+            // or run cannot move the agent's state or route around the egress proxy.
+            continue;
+        }
         set(&mut env, k, v);
     }
     for (k, v) in &ctx.credential_env {
@@ -130,5 +135,28 @@ mod tests {
         assert_eq!(get("FOO").as_deref(), Some("bar"));
         assert_eq!(env.last().unwrap().0, "CLAUDE_CODE_OAUTH_TOKEN");
         assert!(get("ANTHROPIC_API_KEY").is_none());
+    }
+
+    #[test]
+    fn protected_variables_keep_the_runtime_values() {
+        let mut c = ctx();
+        c.egress.https_proxy = Some("http://proxy:3128".into());
+        c.class_env.insert("HOME".into(), "/tmp/elsewhere".into());
+        let env = compose(
+            &c,
+            &[
+                ("HTTPS_PROXY".into(), "".into()),
+                ("XDG_CONFIG_HOME".into(), "/x".into()),
+                ("PATH".into(), "/evil".into()),
+                ("OPENCODE_CONFIG_CONTENT".into(), "{}".into()),
+            ],
+        )
+        .unwrap();
+        let get = |k: &str| env.iter().find(|(ek, _)| ek == k).map(|(_, v)| v.clone());
+        assert_eq!(get("HOME").unwrap(), c.home.to_string_lossy());
+        assert_eq!(get("HTTPS_PROXY").as_deref(), Some("http://proxy:3128"));
+        assert!(get("XDG_CONFIG_HOME").unwrap().ends_with("/.config"));
+        assert_ne!(get("PATH").as_deref(), Some("/evil"));
+        assert_eq!(get("OPENCODE_CONFIG_CONTENT").as_deref(), Some("{}"));
     }
 }

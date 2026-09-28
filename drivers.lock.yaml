@@ -27,6 +27,35 @@ image:
   digest: null                       # set by scripts/build-images.sh --push
   base: docker.io/library/node:22-bookworm-slim
 drivers:
+  - driver: acp
+    protocol: acp/1
+    cli: null          # generic: any ACP stdio agent from a launch description
+    adapter: null
+    auth: per launch (credential provider `files` for provider-keyed auth.json)
+    status: compatible-unauthenticated
+    verified:
+      date: "2026-09-28"
+      suites: [conformance:fake, conformance:opencode-noauth, engine-e2e(launch, overrides)]
+    # Launch profiles: what `acp-conformance` recorded for a concrete CLI. Values, not
+    # pass/fail; the runtime has no CLI-specific branches.
+    profiles:
+      - name: opencode
+        cli: {package: opencode-ai, version: 1.18.32}
+        launch: conformance/opencode.launch.yaml
+        report: conformance/opencode-1.18.32-noauth.json
+        reports: [conformance/opencode-1.18.32-noauth.json, conformance/opencode-1.18.32-fakekey-trap.json]
+        status: compatible-unauthenticated
+        findings:
+          - "initialize ~1.6 s, ACP v1, loadSession + session close/fork/list/resume, authMethods [opencode-login]"
+          - "session/new returns configOptions: model (select), effort, mode (build|plan); no `models` field"
+          - "model: global config file (launch.files) < OPENCODE_CONFIG file < repo opencode.json < OPENCODE_CONFIG_CONTENT"
+          - "without OPENCODE_CONFIG_CONTENT and without auth the model falls back to opencode/* and opencode.ai is called; with the model in OPENCODE_CONFIG_CONTENT and no auth.json, session/prompt returns -32000 AuthRequired (-> AuthEnrollmentRequired)"
+          - "trap repo (opencode.json with model + provider baseURL 127.0.0.1:9) + launch profile: model stays the launch's, requests go to api.openai.com (the launch's baseURL)"
+          - "repo opencode.json can set provider baseURL (key would follow); OPENCODE_CONFIG_CONTENT provider options override it"
+          - "`acp --pure` disables external plugins (use it for untrusted repositories)"
+          - "does not exit on stdin EOF within 15 s: the runtime's terminate (SIGTERM, then SIGKILL of the group) is required"
+          - "usage_update and available_commands_update session updates; no permission requests with permission: allow"
+          - "live prompt/cancel with a real OpenAI key: pending (no key or egress in the recording environment)"
   - driver: fake
     protocol: acp/1
     cli: {package: fake-acp-agent, source: workspace, version: 0.1.0}

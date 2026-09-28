@@ -151,6 +151,8 @@ impl H {
             env,
             run_as_user: None,
             service_account_name: None,
+            launch: None,
+            allow_run_overrides: false,
         }
     }
 
@@ -172,6 +174,7 @@ impl H {
                 timeouts: TimeoutOverrides::default(),
                 resume: ResumePolicy::default(),
                 runner_classes: vec![class],
+                overrides: Default::default(),
             },
             cancel: false,
         };

@@ -25,7 +25,7 @@ struct Cli {
 enum Cmd {
     /// Credential profiles (enrollment, inspection).
     #[command(subcommand)]
-    Auth(AuthCmd),
+    Auth(Box<AuthCmd>),
     /// Runs, attempts, journal events and artifacts (reads PostgreSQL).
     #[command(subcommand)]
     Run(RunCmd),
@@ -181,7 +181,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Auth(c) => auth::run(c).await,
+        Cmd::Auth(c) => auth::run(*c).await,
         Cmd::Run(c) => runs::run(c).await,
     }
 }

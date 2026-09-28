@@ -3,6 +3,21 @@
 version = 4
 
 [[package]]
+name = "acp-conformance"
+version = "0.1.0"
+dependencies = [
+ "acp-runner-acp",
+ "acp-runner-core",
+ "anyhow",
+ "chrono",
+ "clap",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "acp-egress-proxy"
 version = "0.1.0"
 dependencies = [
@@ -100,6 +115,7 @@ dependencies = [
  "chrono",
  "hex",
  "regex",
+ "schemars",
  "serde",
  "serde_json",
  "sha2 0.10.9",

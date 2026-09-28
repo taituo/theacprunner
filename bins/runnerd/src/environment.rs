@@ -276,6 +276,9 @@ pub async fn run_environment(
             Err(reason) => fail_early!(reason),
         };
         credentials_placed(&mut em, spec.credentials.as_ref()).await;
+        if let Err(reason) = place_launch_files(&mut em, &dirs, &spec.home_files).await {
+            fail_early!(reason)
+        }
     }
     macro_rules! fail {
         ($reason:expr) => {
@@ -420,6 +423,11 @@ pub async fn run_environment(
                         }
                     }
                     credentials_placed(&mut em, spec.credentials.as_ref()).await;
+                    if let Err(reason) = place_launch_files(&mut em, &dirs, &spec.home_files).await {
+                        conn.close();
+                        reap_spawned(child.take(), grace).await;
+                        fail!(reason);
+                    }
                 }
                 if conn.send(&ToAgent::Proceed).await.is_err() {
                     conn.close();
@@ -955,6 +963,25 @@ async fn finish_now(
     let _ = em.sink.flush().await;
     let _ = dirs;
     res
+}
+
+async fn place_launch_files(
+    em: &mut Em<'_>,
+    dirs: &RunnerDirs,
+    files: &[acp_runner_core::launch::LaunchFile],
+) -> Result<(), FailureReason> {
+    if files.is_empty() {
+        return Ok(());
+    }
+    let n = crate::home::place_launch_files(&dirs.home, files)?;
+    let targets: Vec<&str> = files.iter().map(|f| f.target.as_str()).collect();
+    em.progress(
+        "launch_files_placed",
+        "launch files placed in the synthetic HOME",
+        json!({"count": n, "targets": targets}),
+    )
+    .await;
+    Ok(())
 }
 
 async fn credentials_placed(em: &mut Em<'_>, layout: Option<&acp_runner_core::attempt_spec::CredentialLayout>) {

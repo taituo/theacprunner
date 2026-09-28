@@ -178,6 +178,7 @@ impl AgentDriver for CodexDriver {
             program: Self::adapter(ctx),
             args: cfg_str_list(&ctx.config, "adapterArgs"),
             env: env::compose(ctx, &Self::driver_env(ctx)?)?,
+            cwd: None,
         };
         Ok(Box::new(AcpProcess::spawn(ctx, launch)?))
     }

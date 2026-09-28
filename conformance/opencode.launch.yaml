@@ -1,0 +1,13 @@
+# Launch profile for opencode (driver: acp). Recorded with acp-conformance; see
+# drivers.lock.yaml for what was observed.
+command: opencode
+args: [acp, --pure]                       # --pure: no external plugins (untrusted repos)
+env:
+  OPENCODE_DISABLE_AUTOUPDATE: "1"
+  OPENCODE_DISABLE_LSP_DOWNLOAD: "1"
+  # Highest-precedence config: beats a repository's own opencode.json. Keep the provider
+  # endpoint here so a repo cannot redirect the API key; the model default lives here too.
+  OPENCODE_CONFIG_CONTENT: '{"model": "openai/gpt-5-mini", "provider": {"openai": {"options": {"baseURL": "https://api.openai.com/v1"}}}}'
+files:
+  - target: .config/opencode/opencode.json
+    content: '{"autoupdate": false, "share": "disabled", "permission": {"edit": "allow", "bash": "allow"}}'

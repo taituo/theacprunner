@@ -30,6 +30,11 @@ use std::str::FromStr;
 pub enum Provider {
     Codex,
     Claude,
+    /// Generic credential file for ACP CLIs that read a provider-keyed `auth.json`
+    /// (opencode: `{"openai": {"type": "api", "key": ...}}`). Placed as a file; no refresh,
+    /// no write-back. API keys are allowed here (the subscription API-key ban applies to the
+    /// Codex and Claude subscriptions only).
+    Files,
 }
 
 impl Provider {
@@ -37,6 +42,7 @@ impl Provider {
         match self {
             Provider::Codex => "codex",
             Provider::Claude => "claude",
+            Provider::Files => "files",
         }
     }
 
@@ -44,6 +50,7 @@ impl Provider {
         match self {
             Provider::Codex => &CODEX_SPEC,
             Provider::Claude => &CLAUDE_SPEC,
+            Provider::Files => &FILES_SPEC,
         }
     }
 }
@@ -60,6 +67,7 @@ impl FromStr for Provider {
         match s {
             "codex" => Ok(Provider::Codex),
             "claude" => Ok(Provider::Claude),
+            "files" => Ok(Provider::Files),
             other => Err(CredentialError::UnknownProvider(other.to_string())),
         }
     }
@@ -116,6 +124,18 @@ pub static CLAUDE_SPEC: ProviderCredentialSpec = ProviderCredentialSpec {
     exclusive_lease: false,
 };
 
+pub static FILES_SPEC: ProviderCredentialSpec = ProviderCredentialSpec {
+    provider: Provider::Files,
+    files: &[CredentialFileSpec {
+        key: "auth.json",
+        default_target: ".local/share/opencode/auth.json",
+        mode: 0o600,
+        writeback: false,
+    }],
+    env: &[],
+    exclusive_lease: false,
+};
+
 /// key -> raw bytes
 pub type CredentialBundle = BTreeMap<String, Vec<u8>>;
 
@@ -146,7 +166,7 @@ pub struct CredentialMetadata {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CredentialError {
-    #[error("unknown provider {0:?} (supported: codex, claude)")]
+    #[error("unknown provider {0:?} (supported: codex, claude, files)")]
     UnknownProvider(String),
     #[error("credential bundle is missing required key {0:?}")]
     MissingKey(String),
@@ -203,7 +223,66 @@ pub fn validate_bundle(provider: Provider, bundle: &CredentialBundle) -> Result<
     match provider {
         Provider::Codex => validate_codex_auth_json(&bundle["auth.json"]),
         Provider::Claude => validate_claude_token(&bundle["oauth-token"]),
+        Provider::Files => validate_files_auth_json(&bundle["auth.json"]),
     }
+}
+
+/// A provider-keyed `auth.json` (opencode layout): an object whose entries are
+/// `{"type": "api", "key": "<non-empty>"}`. OAuth entries are refused for now: their refresh
+/// token rotates during use and would need a verified write-back (see Codex).
+pub fn validate_files_auth_json(bytes: &[u8]) -> Result<CredentialMetadata, CredentialError> {
+    let v: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|_| CredentialError::Malformed("auth.json is not JSON".into()))?;
+    let obj = v.as_object().ok_or_else(|| CredentialError::Malformed("auth.json is not a JSON object".into()))?;
+    if obj.is_empty() {
+        return Err(CredentialError::Malformed("auth.json has no provider entries".into()));
+    }
+    let mut names = vec![];
+    for (name, e) in obj {
+        if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c)) {
+            return Err(CredentialError::Malformed(format!("invalid provider entry name {name:?}")));
+        }
+        match e.get("type").and_then(|t| t.as_str()) {
+            Some("api") => {
+                let key = e.get("key").and_then(|k| k.as_str()).unwrap_or("");
+                if key.trim().is_empty() || key.chars().any(|c| c.is_whitespace() || c.is_control()) {
+                    return Err(CredentialError::Malformed(format!("entry {name:?}: key missing or malformed")));
+                }
+            }
+            Some("oauth") => {
+                return Err(CredentialError::UnsupportedAuthMode(format!(
+                    "entry {name:?} is an OAuth login; refreshable OAuth entries are not supported by the files provider"
+                )));
+            }
+            other => {
+                return Err(CredentialError::UnsupportedAuthMode(format!("entry {name:?}: type {other:?}")));
+            }
+        }
+        names.push(name.clone());
+    }
+    Ok(CredentialMetadata {
+        provider: "files".into(),
+        auth_kind: "api-key-file".into(),
+        material_fingerprint: fingerprint(bytes),
+        notes: vec![
+            format!("provider entries: {}", names.join(", ")),
+            "Static API keys in a provider-keyed auth.json; placed as a file, never refreshed or written back.".into(),
+        ],
+        ..Default::default()
+    })
+}
+
+/// Keep only the named entries of a provider-keyed auth.json (enrollment `--select`).
+pub fn select_auth_entries(bytes: &[u8], select: &[String]) -> Result<Vec<u8>, CredentialError> {
+    let v: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|_| CredentialError::Malformed("auth.json is not JSON".into()))?;
+    let obj = v.as_object().ok_or_else(|| CredentialError::Malformed("auth.json is not a JSON object".into()))?;
+    let mut out = serde_json::Map::new();
+    for name in select {
+        let e = obj.get(name).ok_or_else(|| CredentialError::MissingKey(name.clone()))?;
+        out.insert(name.clone(), e.clone());
+    }
+    Ok(serde_json::to_vec_pretty(&serde_json::Value::Object(out)).expect("json"))
 }
 
 /// Codex auth modes that represent a human/workspace ChatGPT login (not API billing).
@@ -458,6 +537,30 @@ pub(crate) mod tests {
     /// Review finding 1 (structural half): static auth modes never accept a write-back. The
     /// account half (a forged token next to a copied account id) is decided by the controller
     /// redeeming the token at the provider (engine `codex_refresh`, e2e tests).
+    #[test]
+    fn files_provider_accepts_api_entries_only() {
+        let mut b = CredentialBundle::new();
+        b.insert("auth.json".into(), br#"{"openai":{"type":"api","key":"sk-test-123"}}"#.to_vec());
+        let md = validate_bundle(Provider::Files, &b).unwrap();
+        assert_eq!(md.auth_kind, "api-key-file");
+        assert!(!serde_json::to_string(&md).unwrap().contains("sk-test-123"));
+        for bad in [
+            &br#"{"openai":{"type":"oauth","access":"a","refresh":"r","expires":1}}"#[..],
+            br#"{"openai":{"type":"api","key":""}}"#,
+            br#"[]"#,
+            br#"{}"#,
+        ] {
+            b.insert("auth.json".into(), bad.to_vec());
+            assert!(validate_bundle(Provider::Files, &b).is_err(), "{}", String::from_utf8_lossy(bad));
+        }
+        let all = br#"{"openai":{"type":"api","key":"k1"},"google":{"type":"api","key":"k2"}}"#;
+        let sel = select_auth_entries(all, &["openai".into()]).unwrap();
+        assert!(String::from_utf8_lossy(&sel).contains("k1") && !String::from_utf8_lossy(&sel).contains("k2"));
+        assert!(select_auth_entries(all, &["anthropic".into()]).is_err());
+        let enrolled = validate_files_auth_json(br#"{"openai":{"type":"api","key":"k1"}}"#).unwrap();
+        assert!(validate_writeback(Provider::Files, &enrolled, "auth.json", all).is_err());
+    }
+
     #[test]
     fn static_auth_modes_refuse_writeback() {
         let pat =

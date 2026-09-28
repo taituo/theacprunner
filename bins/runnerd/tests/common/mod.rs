@@ -319,6 +319,7 @@ impl TestEnv {
             },
             session: Default::default(),
             bootstrap: Default::default(),
+            home_files: vec![],
         }
     }
 

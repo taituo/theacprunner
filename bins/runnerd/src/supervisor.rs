@@ -450,6 +450,22 @@ pub async fn run_attempt(
         )
         .await;
     }
+    if !spec.home_files.is_empty() {
+        match crate::home::place_launch_files(&dirs.home, &spec.home_files) {
+            Ok(n) => {
+                let targets: Vec<&str> = spec.home_files.iter().map(|f| f.target.as_str()).collect();
+                em.progress(
+                    "launch_files_placed",
+                    "launch files placed in the synthetic HOME",
+                    json!({"count": n, "targets": targets}),
+                )
+                .await
+            }
+            Err(reason) => {
+                return finish(&mut em, result, AttemptPhase::Failed, Some(reason), &dirs, Some(&prepared_home)).await;
+            }
+        }
+    }
     let home = Some(&prepared_home);
 
     // ---- connect agentd ----------------------------------------------------------------

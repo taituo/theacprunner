@@ -63,6 +63,10 @@ pub struct EnrollArgs {
     /// Concurrent leases allowed (claude only; codex profiles are always exclusive).
     #[arg(long, default_value_t = 1)]
     pub max_concurrent_leases: i32,
+    /// files: provider entries of auth.json to keep (repeatable, e.g. `--select openai`).
+    /// With `--token-stdin`, the single entry to create from the API key read from stdin.
+    #[arg(long)]
+    pub select: Vec<String>,
     /// Replace an existing profile.
     #[arg(long)]
     pub force: bool,
@@ -445,6 +449,7 @@ async fn enroll(a: EnrollArgs) -> anyhow::Result<()> {
     let bundle = match provider {
         Provider::Codex => enroll_codex(&a)?,
         Provider::Claude => enroll_claude(&a)?,
+        Provider::Files => enroll_files(&a)?,
     };
     let metadata = validate_bundle(provider, &bundle).context("validating the captured login state")?;
     let max = if provider.spec().exclusive_lease { 1 } else { a.max_concurrent_leases.max(1) };
@@ -578,6 +583,32 @@ fn enroll_claude(a: &EnrollArgs) -> anyhow::Result<CredentialBundle> {
     }
     let mut bundle = CredentialBundle::new();
     bundle.insert("oauth-token".into(), token.into_bytes());
+    Ok(bundle)
+}
+
+/// `files`: a provider-keyed auth.json (opencode layout). Either an existing file reduced to
+/// the `--select`ed entries, or one `{"type":"api","key":...}` entry built from stdin.
+fn enroll_files(a: &EnrollArgs) -> anyhow::Result<CredentialBundle> {
+    if a.select.is_empty() {
+        bail!("--select <provider entry> is required for the files provider (e.g. --select openai)");
+    }
+    let json = if a.token_stdin {
+        if a.select.len() != 1 {
+            bail!("--token-stdin builds exactly one entry; give one --select");
+        }
+        let mut key = String::new();
+        std::io::stdin().read_to_string(&mut key)?;
+        let key = key.trim();
+        let mut m = serde_json::Map::new();
+        m.insert(a.select[0].clone(), serde_json::json!({"type": "api", "key": key}));
+        serde_json::to_vec_pretty(&serde_json::Value::Object(m))?
+    } else {
+        let path = a.from_file.as_ref().context("--from-file <auth.json> or --token-stdin is required")?;
+        let raw = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        acp_runner_core::credentials::select_auth_entries(&raw, &a.select).context("selecting entries")?
+    };
+    let mut bundle = CredentialBundle::new();
+    bundle.insert("auth.json".into(), json);
     Ok(bundle)
 }
 

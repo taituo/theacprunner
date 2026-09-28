@@ -642,6 +642,14 @@ impl Engine {
             _ => None,
         };
         let prompt = capsule.as_ref().map(|c| c.render_prompt()).unwrap_or_else(|| spec.prompt.clone());
+        // Launch description (+ run overrides for the primary class only; model names are
+        // CLI-specific, so a fallback class keeps its own defaults).
+        let launch = class.effective_launch((next.class_index == 0).then_some(&spec.overrides));
+        let driver_config = launch
+            .as_ref()
+            .map(|l| l.driver_config(&class.driver_config))
+            .unwrap_or_else(|| class.driver_config.clone());
+        let home_files = launch.map(|l| l.files).unwrap_or_default();
         let mut attempt_spec = AttemptSpec {
             wire_version: WIRE_VERSION,
             run_id: run.id,
@@ -650,7 +658,7 @@ impl Engine {
             ordinal: next.ordinal,
             class_attempt: next.class_attempt,
             runner_class: class.name.clone(),
-            driver: DriverSpec { name: class.driver.clone(), config: class.driver_config.clone() },
+            driver: DriverSpec { name: class.driver.clone(), config: driver_config },
             repository: spec.repository.clone(),
             prompt,
             capsule,
@@ -670,6 +678,7 @@ impl Engine {
             env: class.env.clone(),
             session: Default::default(),
             bootstrap: Default::default(),
+            home_files,
         };
         let lease = provider.map(|p| LeaseRequest {
             provider: p.as_str().to_string(),

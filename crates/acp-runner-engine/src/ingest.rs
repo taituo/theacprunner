@@ -622,7 +622,9 @@ async fn post_credential(
             }
             crate::codex_refresh::rebuild_auth_json(&t)
         }
-        Provider::Claude => return Err(reject("claude credentials are not written back".into())),
+        Provider::Claude | Provider::Files => {
+            return Err(reject(format!("{provider} credentials are not written back")));
+        }
     };
     let md = validate_writeback(provider, &enrolled, &wb.key, &to_store).map_err(|e| reject(e.to_string()))?;
     st.creds

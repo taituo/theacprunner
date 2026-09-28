@@ -17,6 +17,7 @@ members = [
     "bins/acp-egress-proxy",
     "bins/fake-acp-agent",
     "bins/acp-openai-shim",
+    "bins/acp-conformance",
 ]
 
 [workspace.package]

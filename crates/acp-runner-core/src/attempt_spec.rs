@@ -50,6 +50,10 @@ pub struct AttemptSpec {
     /// Environment bootstrap plan (trusted placement + untrusted exec); empty for one-shot.
     #[serde(default, skip_serializing_if = "BootstrapPlan::is_empty")]
     pub bootstrap: BootstrapPlan,
+    /// Launch files placed below the synthetic HOME by runnerd before the agent starts
+    /// (after the untrusted bootstrap, together with the credentials).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub home_files: Vec<crate::launch::LaunchFile>,
 }
 
 /// How runnerd drives the harness.
