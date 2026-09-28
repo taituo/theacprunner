@@ -36,6 +36,8 @@ JSON
     -v "$WORK/$t:/out" -v "$WORK/secret-$t:/secret:ro" "$IMAGE" \
     local --spec /out/spec.json --out /out --workspace /workspace --home /home/agent --tmp /tmp --secret-dir /secret \
     >"$WORK/$t.log" 2>&1 || true
+  # runnerd (uid 10001) writes 0600 files; make them readable for the host user
+  docker run --rm --entrypoint chmod -v "$WORK/$t:/out" "$IMAGE" -R a+rX /out >/dev/null 2>&1 || true
   if [ ! -f "$WORK/$t/result.json" ]; then
     echo "$t: runnerd produced no result.json"; tail -40 "$WORK/$t.log"
     [ -n "${GITHUB_ACTIONS:-}" ] && echo "::error title=compat-image $t::$(tail -c 3000 "$WORK/$t.log" | tr '\n' ' ')"
