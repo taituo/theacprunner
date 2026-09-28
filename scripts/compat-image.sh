@@ -21,7 +21,7 @@ run_target() {
       mkdir -p "$WORK/secret-$t"; cp "${ACP_COMPAT_CLAUDE_TOKEN_FILE:?}" "$WORK/secret-$t/cred.oauth-token" ;;
     *) echo "unknown target $t"; return 2 ;;
   esac
-  mkdir -p "$WORK/$t" "$WORK/secret-$t"; chmod -R a+rwX "$WORK"
+  mkdir -p "$WORK/$t" "$WORK/secret-$t"; chmod a+rwX "$WORK/$t" "$WORK/secret-$t"
   cat > "$WORK/$t/spec.json" <<JSON
 {"wireVersion":2,"runId":"00000000-0000-0000-0000-000000000001","attemptId":"00000000-0000-0000-0000-000000000002",
  "taskId":"compat","ordinal":1,"classAttempt":1,"runnerClass":"compat-$t",
