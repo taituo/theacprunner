@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 IMAGE=$1; TARGETS=$2
 SHA=dab04cf7a90ba80a2e188cd4864c71abf7b39a74
-WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT
+WORK=$(mktemp -d); trap 'rm -rf "$WORK" 2>/dev/null || true' EXIT
 trap 'rc=$?; [ -n "${GITHUB_ACTIONS:-}" ] && echo "::error title=compat-image::failed at line $LINENO (exit $rc)"' ERR
 chmod 0777 "$WORK"
 run_target() {
