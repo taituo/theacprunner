@@ -82,6 +82,8 @@ kube-apiserver/etcd v1.37 from the controller-runtime envtest bundle, git 2.43, 
 | CLI upgrade flow (`scripts/upgrade-cli.sh codex 0.157.1`: pin → lock → candidate → suite → status) | run on a copy of the repo |
 | Enrollment UX with scripted stand-ins for the provider CLIs (whitelist capture, no secret echo, API-key refusal) | `bins/acp-runnerctl/tests/cli.rs` |
 | `dev-run` demo (fallback run, journal, patch) | `scripts/dev-run.sh` |
+| Review fixes V0–V10 (2026-09-28): verified Codex write-back (fake OAuth issuer, RS256/JWKS), lease fencing, profile policy + image/SA allowlists, bootstrap before credentials + subreaper, durable directives, patch hygiene, egress proxy address classes, generic `acp` driver with launch/overrides, `files` credentials, AgentEnvironment controller with gateway Service | full suite with `ACP_REQUIRE_DB_TESTS=1`: 240 tests, 0 failed, 0 skipped; `kube_e2e::agent_environment_through_the_controller` on envtest |
+| **Real opencode-ai 1.18.32 without a working key** (`acp-conformance`): handshake, session config options, model selection precedence, repository `opencode.json` trap, AuthRequired path, EOF behaviour | `conformance/*.json`, `drivers.lock.yaml` profiles |
 
 **Not executed in the authoring environment** (its egress policy blocked all container
 registries, so no base image could be pulled): building the container images, the KIND
@@ -89,7 +91,9 @@ walkthrough (`scripts/e2e-kind.sh`), the in-image contract smoke (`scripts/compa
 and live subscription smoke tests. These are scripted and wired into CI
 (`.github/workflows/ci.yml`); treat their first run as the acceptance step. No real Codex or
 Claude subscription login was used by the author; `drivers.lock.yaml` records exactly what was
-verified per driver.
+verified per driver. Also not executed: a real multi-node cluster (L3: gVisor, Cilium/Calico,
+KMS), a live opencode prompt/cancel with a real OpenAI key, and `cargo deny check advisories`
+(the advisory database could not be fetched; `licenses` passes).
 
 ## 2. Architecture
 
