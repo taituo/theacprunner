@@ -627,10 +627,22 @@ async fn post_credential(
         }
     };
     let md = validate_writeback(provider, &enrolled, &wb.key, &to_store).map_err(|e| reject(e.to_string()))?;
-    st.creds
-        .update_file(&profile, &wb.key, &to_store, &md)
-        .await
-        .map_err(|e| ApiError(StatusCode::SERVICE_UNAVAILABLE, format!("credential store: {e}")))?;
+    // The provider has already rotated the refresh token: losing these tokens now would leave
+    // the profile needing re-enrollment, so concurrent-modification conflicts are retried.
+    let mut tries = 0;
+    loop {
+        match st.creds.update_file(&profile, &wb.key, &to_store, &md).await {
+            Ok(()) => break,
+            Err(crate::creds::CredStoreError::Conflict(_)) if tries < 4 => {
+                tries += 1;
+                tokio::time::sleep(Duration::from_millis(200 * tries)).await;
+            }
+            Err(e) => {
+                tracing::error!(profile = %profile, error = %e, "storing verified refreshed credential failed; profile may need re-enrollment");
+                return Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, format!("credential store: {e}")));
+            }
+        }
+    }
     lock.commit().await?;
     st.journal
         .record_writeback(&profile, &serde_json::to_value(&md).unwrap_or_default(), &fingerprint(&to_store))

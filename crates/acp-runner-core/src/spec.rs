@@ -412,8 +412,7 @@ impl RunSpec {
                     "overrides need a class with a launch description".into(),
                 ));
             }
-            crate::launch::validate_env(&self.overrides.env).map_err(|e| SpecError::Invalid("overrides", e))?;
-            crate::launch::validate_files(&self.overrides.files).map_err(|e| SpecError::Invalid("overrides", e))?;
+            self.overrides.validate().map_err(|e| SpecError::Invalid("overrides", e))?;
         }
         for c in &self.runner_classes {
             c.validate()?;

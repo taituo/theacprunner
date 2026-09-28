@@ -531,7 +531,10 @@ is acted on once (`status.lifecycleRequested`). A silent runnerd fails the envir
 (`HeartbeatLost`/`StartTimeout`); runnerd in turn stops the harness when it cannot reach the
 controller for the credential lease window minus 60 s. The credential lease is released only
 after the backend reports the sandbox gone (fencing), and deletion keeps the finalizer until
-then. Verified on envtest with the simulated kubelet (`kube_e2e::agent_environment_through_the_controller`).
+then. Environments created through the provider API (and `branch()`es) have no owning
+resource: their sandboxes carry no owner references (a dangling one would make the garbage
+collector delete them) and are ended by the provider (finish/cancel/destroy) or by heartbeat
+loss detection when the provider refreshes them. Verified on envtest with the simulated kubelet (`kube_e2e::agent_environment_through_the_controller`).
 
 **Controller replicas.** Safe to run more than one: every reconcile holds a
 transaction-scoped PostgreSQL advisory lock on the run; attempts carry a supervision lease
@@ -716,8 +719,11 @@ allowRunOverrides: true      # lets ACPRun.spec.overrides {env, files} add/repla
 
 `files` are written below the synthetic HOME by runnerd (never into the workspace, so they
 are not part of the patch; in environments after the untrusted bootstrap). Runtime variables
-(`HOME`, `XDG_*`, `PATH`, `TMPDIR`, proxy and CA variables) are always set last and cannot be
-changed by a launch or an override. An environment uses the same shape as
+(`HOME`, `XDG_*`, `PATH`, `TMPDIR`, proxy and CA variables) are always set last: a launch
+cannot change them, and a run override that names one — or a code-injection variable such as
+`LD_PRELOAD`, `NODE_OPTIONS`, `BASH_ENV` — is refused before any pod is created.
+`allowRunOverrides` still lets a run replace harness configuration, so grant it only where the
+namespace is already trusted with the class' credentials (profile policy). An environment uses the same shape as
 `harness: {name: acp, config: <launch>}`; its credential layout comes from the profile's
 provider. Differences between ACP implementations are measured, not coded:
 `acp-conformance --launch <file>` (or `scripts/conformance.sh`) records handshake latency,

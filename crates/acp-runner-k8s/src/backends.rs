@@ -169,7 +169,14 @@ impl SandboxBackend for PodBackend {
         wait_gone(&secrets, &secret_name(req), Duration::from_secs(10)).await?;
         secrets.create(&PostParams::default(), &build_secret(req, &self.cfg)).await.map_err(err)?;
         pods.create(&PostParams::default(), &build_pod(req, &self.cfg)).await.map_err(err)?;
-        create_gateway_service(&self.client, &ns, req, &self.cfg).await?;
+        if let Err(e) = create_gateway_service(&self.client, &ns, req, &self.cfg).await {
+            // never leave a running pod (with credential copies) behind a failed create:
+            // the caller treats the sandbox as absent and releases its lease
+            let _ = delete_ignore_missing(&pods, &req.name, Some(0)).await;
+            let _ = delete_ignore_missing(&secrets, &secret_name(req), None).await;
+            let _ = wait_gone(&pods, &req.name, Duration::from_secs(60)).await;
+            return Err(e);
+        }
         Ok(SandboxRef { backend: "pod".into(), namespace: Some(ns), name: req.name.clone() })
     }
 
@@ -258,7 +265,12 @@ impl SandboxBackend for AgentSandboxBackend {
         let obj: DynamicObject = serde_json::from_value(Self::build_sandbox(req, &self.cfg))
             .map_err(|e| BackendError::Permanent(e.to_string()))?;
         api.create(&PostParams::default(), &obj).await.map_err(err)?;
-        create_gateway_service(&self.client, &ns, req, &self.cfg).await?;
+        if let Err(e) = create_gateway_service(&self.client, &ns, req, &self.cfg).await {
+            let _ = delete_ignore_missing(&api, &req.name, None).await;
+            let _ = delete_ignore_missing(&secrets, &secret_name(req), None).await;
+            let _ = wait_gone(&api, &req.name, Duration::from_secs(60)).await;
+            return Err(e);
+        }
         Ok(SandboxRef { backend: "agent-sandbox".into(), namespace: Some(ns), name: req.name.clone() })
     }
 

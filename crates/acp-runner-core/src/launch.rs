@@ -41,6 +41,24 @@ pub const PROTECTED_ENV: &[&str] = &[
     "SSL_CERT_FILE",
 ];
 
+/// Variables a *run override* may not set (a class launch may): they inject code into every
+/// process of the harness. `allowRunOverrides` still lets a run replace harness
+/// configuration (files, config variables) — grant it only to namespaces trusted with the
+/// class' credentials (profile policy).
+pub const OVERRIDE_DENIED_ENV: &[&str] = &[
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "LD_AUDIT",
+    "NODE_OPTIONS",
+    "NODE_PATH",
+    "BASH_ENV",
+    "ENV",
+    "PYTHONPATH",
+    "PYTHONSTARTUP",
+    "SSL_CERT_DIR",
+    "GIT_SSH_COMMAND",
+];
+
 pub fn is_protected_env(name: &str) -> bool {
     PROTECTED_ENV.contains(&name)
 }
@@ -88,6 +106,14 @@ pub struct RunOverrides {
 impl RunOverrides {
     pub fn is_empty(&self) -> bool {
         self.env.is_empty() && self.files.is_empty()
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        validate_env(&self.env)?;
+        if let Some(k) = self.env.keys().find(|k| OVERRIDE_DENIED_ENV.contains(&k.as_str()) || is_protected_env(k)) {
+            return Err(format!("overrides.env: {k} cannot be set by a run"));
+        }
+        validate_files(&self.files)
     }
 }
 
@@ -218,6 +244,19 @@ mod tests {
         assert_eq!(cfg["command"], "opencode");
         assert_eq!(cfg["scenario"], "fix");
         assert!(cfg.get("files").is_none());
+    }
+
+    #[test]
+    fn run_overrides_cannot_inject_code_or_move_the_runtime() {
+        for k in ["LD_PRELOAD", "NODE_OPTIONS", "HOME", "HTTPS_PROXY"] {
+            let o = RunOverrides { env: BTreeMap::from([(k.to_string(), "x".to_string())]), files: vec![] };
+            assert!(o.validate().is_err(), "{k}");
+        }
+        let o = RunOverrides {
+            env: BTreeMap::from([("OPENCODE_CONFIG_CONTENT".to_string(), "{}".to_string())]),
+            files: vec![],
+        };
+        assert!(o.validate().is_ok());
     }
 
     #[test]

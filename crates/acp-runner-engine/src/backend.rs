@@ -57,13 +57,19 @@ pub enum OwnerKind {
     #[default]
     Run,
     Environment,
+    /// No owning resource (provider-API environments and branches): no owner references —
+    /// a reference to a resource that does not exist would make the garbage collector
+    /// delete the sandbox. Cleanup is the provider's (finish/cancel/destroy, heartbeat loss).
+    Detached,
 }
 
 impl OwnerKind {
-    pub fn kind(self) -> &'static str {
+    /// Kind for owner references; `None` = do not set any.
+    pub fn kind(self) -> Option<&'static str> {
         match self {
-            OwnerKind::Run => "ACPRun",
-            OwnerKind::Environment => "AgentEnvironment",
+            OwnerKind::Run => Some("ACPRun"),
+            OwnerKind::Environment => Some("AgentEnvironment"),
+            OwnerKind::Detached => None,
         }
     }
 }

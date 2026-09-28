@@ -71,7 +71,17 @@ impl AcpDriver {
             Some(c) => {
                 acp_runner_core::paths::validate_relative_path(&c)
                     .map_err(|e| DriverError::Config(format!("launch.cwd: {e}")))?;
-                Some(ctx.workspace.join(c))
+                // resolved (symlinks followed) it must still be a directory in the workspace
+                let p = ctx.workspace.join(&c);
+                let (real, root) = (std::fs::canonicalize(&p), std::fs::canonicalize(&ctx.workspace));
+                match (real, root) {
+                    (Ok(r), Ok(w)) if r.starts_with(&w) && r.is_dir() => Some(r),
+                    _ => {
+                        return Err(DriverError::Config(format!(
+                            "launch.cwd {c:?} is not a directory inside the workspace"
+                        )));
+                    }
+                }
             }
             None => None,
         };

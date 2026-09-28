@@ -86,9 +86,10 @@ impl PodConfig {
         if self.agent_namespace.as_deref().is_some_and(|ns| ns != req.run_key.namespace) {
             return None; // cross-namespace owner references are not allowed; finalizer cleans up
         }
+        let kind = req.owner_kind.kind()?;
         Some(vec![OwnerReference {
             api_version: format!("{}/{}", crate::crds::GROUP, crate::crds::VERSION),
-            kind: req.owner_kind.kind().into(),
+            kind: kind.into(),
             name: req.run_key.name.clone(),
             uid: req.run_key.uid.clone(),
             controller: Some(true),
@@ -467,6 +468,14 @@ pub(crate) mod tests {
         let runnerd = container(&pod["spec"], RUNNERD_CONTAINER);
         assert_eq!(runnerd["ports"][0]["containerPort"], 7443);
         assert!(container(&pod["spec"], AGENTD_CONTAINER).get("ports").is_none());
+    }
+
+    #[test]
+    fn detached_sandboxes_have_no_owner_refs() {
+        let mut req = request(None);
+        req.owner_kind = acp_runner_engine::backend::OwnerKind::Detached;
+        let pod = serde_json::to_value(build_pod(&req, &PodConfig::default())).unwrap();
+        assert!(pod["metadata"].get("ownerReferences").is_none(), "{}", pod["metadata"]);
     }
 
     #[test]

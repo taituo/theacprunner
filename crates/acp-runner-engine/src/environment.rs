@@ -487,6 +487,18 @@ impl EnvironmentProvider {
     /// recorded on the run; its uid makes creation idempotent. `None` = provider-internal
     /// namespace `environments` (library use, tests).
     pub async fn create_in(&self, owner: Option<RunKey>, spec: EnvironmentSpec) -> Result<EnvironmentView> {
+        let kind = if owner.is_some() { OwnerKind::Environment } else { OwnerKind::Detached };
+        self.create_owned(owner, kind, spec).await
+    }
+
+    /// `owner` places the environment's run (namespace/name/uid); `kind` says whether that is
+    /// a real resource the sandbox may reference (AgentEnvironment) or not (Detached).
+    async fn create_owned(
+        &self,
+        owner: Option<RunKey>,
+        kind: OwnerKind,
+        spec: EnvironmentSpec,
+    ) -> Result<EnvironmentView> {
         spec.validate().map_err(|e| ProviderError::InvalidSpec(e.to_string()))?;
         if self.cfg.require_egress_proxy_for_credentials
             && spec.uses_credentials()
@@ -547,7 +559,7 @@ impl EnvironmentProvider {
             .await?;
         // An owning resource (AgentEnvironment) gets exactly one environment, even when the
         // status update after a create was lost or two controller replicas race.
-        let _owner_lock = if owner.is_some() {
+        let _owner_lock = if kind == OwnerKind::Environment {
             let Some(lock) = self.journal.try_lock_run(run.id).await? else {
                 anyhow::bail!("another controller instance is creating this environment");
             };
@@ -719,7 +731,7 @@ impl EnvironmentProvider {
                 hex::encode(gateway_key).into_bytes(),
             )]),
             timeouts: t,
-            owner_kind: if owner.is_some() { OwnerKind::Environment } else { OwnerKind::Run },
+            owner_kind: kind,
             gateway_port: gateway_port(&self.cfg.gateway_listen),
         };
         match self.backend.create(&req).await {
@@ -765,7 +777,8 @@ impl EnvironmentProvider {
             name: format!("{}-{short}", origin.k8s_name),
             uid: Uuid::now_v7().to_string(),
         });
-        self.create_in(owner, spec).await
+        // same namespace as the origin, but no owning resource (the branch is provider-managed)
+        self.create_owned(owner, OwnerKind::Detached, spec).await
     }
 
     /// Release what an ended environment holds: sandbox and credential lease (after the
@@ -796,6 +809,12 @@ impl EnvironmentProvider {
             tracing::debug!(environment_id = %env.id, "credential lease released");
         }
         true
+    }
+
+    /// The environment created for an owning resource (by its uid), if any.
+    pub async fn environment_for_owner(&self, owner_uid: &str) -> Result<Option<Uuid>> {
+        let Some(run) = self.journal.run_by_uid(owner_uid).await? else { return Ok(None) };
+        Ok(self.journal.environments_for_run(run.id).await?.into_iter().next().map(|e| e.id))
     }
 
     /// Controller hook: bring a terminal environment's resources down. `Ok(true)` when the
@@ -1130,7 +1149,7 @@ fn gateway_port(listen: &str) -> Option<u16> {
 }
 
 /// runnerd stops the harness this long before an unrenewed credential lease would lapse.
-const CONTROLLER_LOSS_MARGIN_SECONDS: u64 = 60;
+const CONTROLLER_LOSS_MARGIN_SECONDS: u64 = 120;
 
 fn env_terminate_grace() -> u64 {
     20

@@ -89,9 +89,21 @@ fn env_id(env: &AgentEnvironment) -> Option<Uuid> {
     env.status.as_ref().and_then(|s| s.environment_id.as_deref()).and_then(|s| s.parse().ok())
 }
 
+/// The environment id from status, or — when a status update was lost or overwritten —
+/// from the journal (the run of this resource's uid).
+async fn resolve_id(env: &AgentEnvironment, ctx: &Ctx) -> Result<Option<Uuid>, Error> {
+    if let Some(id) = env_id(env) {
+        return Ok(Some(id));
+    }
+    ctx.provider
+        .environment_for_owner(&env.uid().unwrap_or_default())
+        .await
+        .map_err(|e| Error::Provider(format!("{e:#}")))
+}
+
 async fn apply(env: Arc<AgentEnvironment>, ctx: Arc<Ctx>) -> Result<Action, Error> {
     let generation = env.metadata.generation;
-    let id = match env_id(&env) {
+    let id = match resolve_id(&env, &ctx).await? {
         Some(id) => id,
         None => {
             let spec = match env.spec.to_core() {
@@ -173,7 +185,7 @@ async fn apply(env: Arc<AgentEnvironment>, ctx: Arc<Ctx>) -> Result<Action, Erro
 }
 
 async fn cleanup(env: Arc<AgentEnvironment>, ctx: Arc<Ctx>) -> Result<Action, Error> {
-    let Some(id) = env_id(&env) else { return Ok(Action::await_change()) };
+    let Some(id) = resolve_id(&env, &ctx).await? else { return Ok(Action::await_change()) };
     // No graceful finish on delete: the sandbox is terminated; the finalizer stays until it
     // is gone and the credential lease is released (fencing).
     if !ctx.provider.force_end(id, "AgentEnvironment deleted").await.map_err(|e| Error::Provider(format!("{e:#}")))? {

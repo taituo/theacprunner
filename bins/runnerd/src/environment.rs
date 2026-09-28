@@ -525,6 +525,7 @@ pub async fn run_environment(
     let idle_timeout = idle_timeout_seconds.map(Duration::from_secs);
     let controller_loss_stop = controller_loss_stop_seconds.map(Duration::from_secs);
     let mut last_heartbeat_ok = Instant::now();
+    let heartbeat_budget = (hb_every * 2).max(Duration::from_secs(10));
     let max_lifetime = max_lifetime_seconds.map(Duration::from_secs);
     let mut hb = tokio::time::interval(hb_every);
     let mut tick = tokio::time::interval(Duration::from_millis(250));
@@ -578,24 +579,29 @@ pub async fn run_environment(
                 let hb = HeartbeatData { agent_alive: state.agent_open, agent_pid: None, seconds_since_progress: None, stage: state.phase.as_str().to_string() };
                 // Provider operations (snapshot/finish/cancel) arrive on the heartbeat reply
                 // (controller -> runnerd); they never travel on the ACP dataplane.
-                let reply = match em.sink.heartbeat(&hb).await {
-                    Ok(r) => {
+                // bounded: a stalled controller must not stall the fail-safe below
+                let reply = match tokio::time::timeout(heartbeat_budget, em.sink.heartbeat(&hb)).await {
+                    Ok(Ok(r)) => {
                         last_heartbeat_ok = Instant::now();
                         r
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         tracing::warn!(error = %e, "heartbeat failed");
-                        if let Some(limit) = controller_loss_stop
-                            && last_heartbeat_ok.elapsed() > limit
-                        {
-                            break Finish::Cancel(format!(
-                                "controller unreachable for {}s; stopping the harness before its credential lease can lapse",
-                                last_heartbeat_ok.elapsed().as_secs()
-                            ));
-                        }
+                        Default::default()
+                    }
+                    Err(_) => {
+                        tracing::warn!("heartbeat timed out after {heartbeat_budget:?}");
                         Default::default()
                     }
                 };
+                if let Some(limit) = controller_loss_stop
+                    && last_heartbeat_ok.elapsed() > limit
+                {
+                    break Finish::Cancel(format!(
+                        "controller unreachable for {}s; stopping the harness before its credential lease can lapse",
+                        last_heartbeat_ok.elapsed().as_secs()
+                    ));
+                }
                 if let Some(directive) = reply.directive {
                     // Durable directives are redelivered until acknowledged; handle each once.
                     if let Some(id) = reply.directive_id {
@@ -621,6 +627,14 @@ pub async fn run_environment(
                 }
             }
             _ = tick.tick() => {
+                if let Some(limit) = controller_loss_stop
+                    && last_heartbeat_ok.elapsed() > limit
+                {
+                    break Finish::Cancel(format!(
+                        "controller unreachable for {}s; stopping the harness before its credential lease can lapse",
+                        last_heartbeat_ok.elapsed().as_secs()
+                    ));
+                }
                 if *external_cancel.borrow() {
                     break Finish::Cancel("runnerd received SIGTERM".into());
                 }
