@@ -34,13 +34,24 @@ JSON
   docker run --rm --read-only --tmpfs /tmp --tmpfs /workspace:uid=10001 --tmpfs /home/agent:uid=10001 \
     --cap-drop ALL --security-opt no-new-privileges \
     -v "$WORK/$t:/out" -v "$WORK/secret-$t:/secret:ro" "$IMAGE" \
-    local --spec /out/spec.json --out /out --workspace /workspace --home /home/agent --tmp /tmp --secret-dir /secret >/dev/null
+    local --spec /out/spec.json --out /out --workspace /workspace --home /home/agent --tmp /tmp --secret-dir /secret \
+    >"$WORK/$t.log" 2>&1 || true
+  if [ ! -f "$WORK/$t/result.json" ]; then
+    echo "$t: runnerd produced no result.json"; tail -40 "$WORK/$t.log"
+    [ -n "${GITHUB_ACTIONS:-}" ] && echo "::error title=compat-image $t::$(tail -c 3000 "$WORK/$t.log" | tr '\n' ' ')"
+    return 1
+  fi
   local phase; phase=$(python3 -c "import json;print(json.load(open('$WORK/$t/result.json'))['phase'])")
   echo "$t: $phase (expected $expect)"
-  [ "$phase" = "$expect" ] || { cat "$WORK/$t/events.jsonl" | tail -20; return 1; }
+  if [ "$phase" != "$expect" ]; then
+    tail -20 "$WORK/$t/events.jsonl"
+    [ -n "${GITHUB_ACTIONS:-}" ] && echo "::error title=compat-image $t ($phase, expected $expect)::$(tail -c 3000 "$WORK/$t/events.jsonl" | tr '\n' ' ')"
+    return 1
+  fi
   if [ "$expect" = Succeeded ]; then
     test -s "$WORK/$t/patch.diff" && grep -q '^diff --git a/add.sh' "$WORK/$t/patch.diff"
   fi
 }
-IFS=, ; for t in $TARGETS; do run_target "$t"; done
+IFS=, read -ra TL <<< "$TARGETS"
+for t in "${TL[@]}"; do run_target "$t"; done
 echo "compat-image: PASSED for $TARGETS on $IMAGE"
