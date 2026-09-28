@@ -433,10 +433,13 @@ async fn post_events(
             (_, None) => Some(FailureReason::internal("runner reported failure without reason")),
         };
         let outcome = json!({"stopReason": data.stop_reason, "summary": data.summary});
+        // The artifact is recorded before the phase changes: a reconcile running in between
+        // would otherwise see a Succeeded attempt without its artifact and finish the run
+        // without a result (seen as a flaky kube e2e in CI).
+        if let Some(id) = data.artifact_id {
+            st.journal.set_attempt_details(a.id, None, None, Some(id)).await?;
+        }
         if st.journal.transition_attempt(a.id, &AttemptPhase::ACTIVE, phase, reason.as_ref(), Some(&outcome)).await? {
-            if let Some(id) = data.artifact_id {
-                st.journal.set_attempt_details(a.id, None, None, Some(id)).await?;
-            }
             record_attempt_finished(&st.metrics, &a, phase, reason.as_ref());
             tracing::info!(run_id = %a.run_id, attempt_id = %a.id, driver = %a.driver, phase = %phase,
                 reason = ?reason.as_ref().map(|r| r.code()), "attempt reported terminal state");
