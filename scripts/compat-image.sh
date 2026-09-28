@@ -2,7 +2,7 @@
 # Run a driver contract smoke inside a runner image with `runnerd local`.
 #   scripts/compat-image.sh IMAGE TARGETS
 # Targets: fake-acp | codex-noauth | codex (needs ACP_COMPAT_CODEX_AUTH_JSON) | claude (needs ACP_COMPAT_CLAUDE_TOKEN_FILE)
-set -euo pipefail
+set -Eeuo pipefail
 IMAGE=$1; TARGETS=$2
 SHA=dab04cf7a90ba80a2e188cd4864c71abf7b39a74
 WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT
